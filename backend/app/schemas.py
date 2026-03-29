@@ -74,7 +74,9 @@ class ApiLogRead(BaseModel):
 
 
 class ConfigRead(BaseModel):
+    LLM_PROVIDER: str
     LLM_MODEL: str
+    ANTHROPIC_MODEL: str
     LLM_TEMPERATURE: float
     LLM_MAX_TOKENS: int
     RESEARCH_SOURCES: List[str]
@@ -85,7 +87,9 @@ class ConfigRead(BaseModel):
 
 
 class ConfigUpdate(BaseModel):
+    LLM_PROVIDER: Optional[str] = None
     LLM_MODEL: Optional[str] = None
+    ANTHROPIC_MODEL: Optional[str] = None
     LLM_TEMPERATURE: Optional[float] = None
     LLM_MAX_TOKENS: Optional[int] = None
     RESEARCH_SOURCES: Optional[List[str]] = None

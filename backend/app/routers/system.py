@@ -36,7 +36,9 @@ async def get_logs(
 @router.get("/config", response_model=ConfigRead)
 async def get_config():
     return ConfigRead(
+        LLM_PROVIDER=settings.LLM_PROVIDER,
         LLM_MODEL=settings.LLM_MODEL,
+        ANTHROPIC_MODEL=settings.ANTHROPIC_MODEL,
         LLM_TEMPERATURE=settings.LLM_TEMPERATURE,
         LLM_MAX_TOKENS=settings.LLM_MAX_TOKENS,
         RESEARCH_SOURCES=settings.RESEARCH_SOURCES,
@@ -49,8 +51,12 @@ async def get_config():
 
 @router.post("/config", response_model=ConfigRead)
 async def update_config(payload: ConfigUpdate):
+    if payload.LLM_PROVIDER is not None:
+        settings.LLM_PROVIDER = payload.LLM_PROVIDER
     if payload.LLM_MODEL is not None:
         settings.LLM_MODEL = payload.LLM_MODEL
+    if payload.ANTHROPIC_MODEL is not None:
+        settings.ANTHROPIC_MODEL = payload.ANTHROPIC_MODEL
     if payload.LLM_TEMPERATURE is not None:
         settings.LLM_TEMPERATURE = payload.LLM_TEMPERATURE
     if payload.LLM_MAX_TOKENS is not None:

@@ -1,8 +1,12 @@
 import json
+import logging
 import time
 import httpx
 from app.agents.base import AgentBase
+from app.agents.llm_client import is_llm_available, timed_chat_completion
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 MOCK_SOURCES = [
@@ -43,6 +47,11 @@ class ResearchAgent(AgentBase):
         await self._update_agent_state(db, project_id, "running")
         queries = input_data.get("queries", [])
         sources_list = input_data.get("sources", settings.RESEARCH_SOURCES)
+        topic = input_data.get("topic", "")
+
+        # Use LLM to refine/expand search queries when available
+        if is_llm_available() and queries:
+            queries = await self._llm_refine_queries(queries, topic, project_id, db)
 
         all_sources = []
         for source in sources_list:
@@ -61,9 +70,63 @@ class ResearchAgent(AgentBase):
                 seen.add(key)
                 unique_sources.append(s)
 
-        result = {"sources": unique_sources, "total_found": len(unique_sources)}
+        # Use LLM to synthesize a research summary from gathered sources
+        summary = ""
+        if is_llm_available() and unique_sources:
+            summary = await self._llm_summarize(unique_sources, topic, project_id, db)
+
+        result = {
+            "sources": unique_sources,
+            "total_found": len(unique_sources),
+            "summary": summary,
+        }
         await self._update_agent_state(db, project_id, "completed", result)
         return result
+
+    async def _llm_refine_queries(self, queries: list, topic: str, project_id: str, db) -> list:
+        """Use LLM to generate focused academic search queries from the input list."""
+        try:
+            queries_text = "\n".join(f"- {q}" for q in queries[:5])
+            prompt = (
+                f"You are a research librarian. Given the following search queries for the topic '{topic}', "
+                "return an improved JSON list of up to 5 precise academic search queries that will find "
+                "high-quality peer-reviewed papers. Output ONLY a JSON array of strings.\n\n"
+                f"Original queries:\n{queries_text}"
+            )
+            content = await timed_chat_completion(
+                prompt,
+                db=db,
+                agent_name=self.name,
+                log_api_call_fn=self._log_api_call,
+            )
+            refined = json.loads(content)
+            if isinstance(refined, list) and all(isinstance(q, str) for q in refined):
+                return refined
+            logger.warning("LLM query refinement returned unexpected format; using original queries.")
+        except Exception as exc:
+            logger.warning("LLM query refinement failed (%s); using original queries.", exc)
+        return queries
+
+    async def _llm_summarize(self, sources: list, topic: str, project_id: str, db) -> str:
+        """Use LLM to synthesize a brief research summary from gathered sources."""
+        try:
+            sources_text = json.dumps(
+                [{"title": s.get("title"), "abstract": s.get("abstract", "")[:200]} for s in sources[:5]]
+            )
+            prompt = (
+                f"Based on the following research sources about '{topic}', write a concise 2-3 sentence "
+                "synthesis that highlights key themes, findings, and research gaps.\n\n"
+                f"Sources: {sources_text}"
+            )
+            return await timed_chat_completion(
+                prompt,
+                db=db,
+                agent_name=self.name,
+                log_api_call_fn=self._log_api_call,
+                max_tokens=256,
+            )
+        except Exception:
+            return ""
 
     async def _search_arxiv(self, queries: list, project_id: str, db) -> list:
         results = []

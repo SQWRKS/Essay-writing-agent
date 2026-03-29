@@ -4,10 +4,23 @@ from typing import List
 
 class Settings(BaseSettings):
     DATABASE_URL: str = "sqlite+aiosqlite:///./essay_agent.db"
+
+    # ── LLM Provider ─────────────────────────────────────────────────────────
+    # Select the active provider: "openai" (default) or "anthropic"
+    LLM_PROVIDER: str = "openai"
+
+    # OpenAI settings
     OPENAI_API_KEY: str = ""
     LLM_MODEL: str = "gpt-4o-mini"
+
+    # Anthropic settings
+    ANTHROPIC_API_KEY: str = ""
+    ANTHROPIC_MODEL: str = "claude-3-5-haiku-latest"
+
+    # Shared LLM settings
     LLM_TEMPERATURE: float = 0.7
     LLM_MAX_TOKENS: int = 4096
+
     RESEARCH_SOURCES: List[str] = ["arxiv", "semantic_scholar", "web"]
     LOG_LEVEL: str = "INFO"
     BACKEND_PORT: int = 8000

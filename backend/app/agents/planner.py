@@ -1,5 +1,6 @@
 import json
 from app.agents.base import AgentBase
+from app.agents.llm_client import is_llm_available, timed_chat_completion
 from app.core.config import settings
 
 
@@ -50,7 +51,7 @@ class PlannerAgent(AgentBase):
         await self._update_agent_state(db, project_id, "running")
         topic = input_data.get("topic", "")
 
-        if settings.OPENAI_API_KEY:
+        if is_llm_available():
             result = await self._llm_plan(topic, project_id, db)
         else:
             result = self._template_plan(topic)
@@ -82,26 +83,19 @@ class PlannerAgent(AgentBase):
         }
 
     async def _llm_plan(self, topic: str, project_id: str, db) -> dict:
-        import time
         try:
-            from openai import AsyncOpenAI
-            client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
             prompt = (
                 f"Create a detailed academic essay plan for the topic: '{topic}'. "
                 "Return a JSON object with keys: sections (list), research_queries (list), estimated_total_words (int). "
                 "Each section must have: key, title, description, research_queries (list of 3), word_count_target."
             )
-            start = time.monotonic()
-            response = await client.chat.completions.create(
-                model=settings.LLM_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=settings.LLM_TEMPERATURE,
-                max_tokens=settings.LLM_MAX_TOKENS,
+            content = await timed_chat_completion(
+                prompt,
+                db=db,
+                agent_name=self.name,
+                log_api_call_fn=self._log_api_call,
                 response_format={"type": "json_object"},
             )
-            duration = (time.monotonic() - start) * 1000
-            await self._log_api_call(db, "/openai/chat", "POST", self.name, duration, 200)
-            content = response.choices[0].message.content
             return json.loads(content)
         except Exception:
             return self._template_plan(topic)
