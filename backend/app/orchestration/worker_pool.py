@@ -80,7 +80,7 @@ class WorkerPool:
 
             # --- RESEARCH ---
             queries = plan.get("research_queries", [f"{topic} overview", f"{topic} methods"])
-            research_input = {"queries": queries[:6], "sources": settings.RESEARCH_SOURCES}
+            research_input = {"topic": topic, "queries": queries[:6], "sources": settings.RESEARCH_SOURCES}
             research_task = await self._create_task(db, project_id, "research", research_input, [planner_task.id])
             graph.add_task(research_task.id, "research", [planner_task.id])
             await db.commit()
@@ -89,10 +89,11 @@ class WorkerPool:
             graph.mark_completed(research_task.id)
 
             content["metadata"]["research"] = {
-                "queries": queries,
+                "queries": research_result.get("queries", queries),
                 "source_breakdown": research_result.get("source_breakdown", {}),
                 "total_found": research_result.get("total_found", 0),
                 "summary": research_result.get("summary", ""),
+                "summaries": research_result.get("summaries", []),
             }
 
             # --- VERIFICATION ---
@@ -106,6 +107,20 @@ class WorkerPool:
             verified_sources = verify_result.get("verified_sources", research_result.get("sources", []))
             content["metadata"]["sources"] = verified_sources
 
+            # --- THESIS ---
+            thesis_input = {
+                "topic": topic,
+                "research_summaries": research_result.get("summaries", []),
+            }
+            thesis_task = await self._create_task(db, project_id, "thesis", thesis_input, [verify_task.id])
+            graph.add_task(thesis_task.id, "thesis", [verify_task.id])
+            await db.commit()
+
+            thesis_result = await self._run_task(thesis_task, db, project_id, thesis_input)
+            graph.mark_completed(thesis_task.id)
+            thesis_statement = thesis_result.get("thesis", "")
+            content["metadata"]["thesis"] = thesis_statement
+
             # --- WRITER + REVIEWER per section ---
             sections = plan.get("sections", [])
             if not sections:
@@ -115,19 +130,24 @@ class WorkerPool:
             for section_info in sections:
                 sec_key = section_info.get("key", "introduction")
                 section_evidence = self._build_section_evidence(section_info, verified_sources)
+                section_notes = self._build_section_notes(section_info, research_result.get("summaries", []), section_evidence)
                 writer_input = {
                     "section": sec_key,
                     "topic": topic,
+                    "thesis": thesis_statement,
+                    "research_notes": section_notes,
                     "word_count": section_info.get("word_count_target", 500),
                     "research_data": {
                         "sources": verified_sources,
+                        "summaries": research_result.get("summaries", []),
+                        "thesis": thesis_statement,
                         "section_queries": section_info.get("research_queries", []),
                         "evidence_pack": section_evidence,
                         "research_summary": research_result.get("summary", ""),
                     },
                 }
-                writer_task = await self._create_task(db, project_id, "writer", writer_input, [verify_task.id])
-                graph.add_task(writer_task.id, "writer", [verify_task.id])
+                writer_task = await self._create_task(db, project_id, "writer", writer_input, [thesis_task.id])
+                graph.add_task(writer_task.id, "writer", [thesis_task.id])
                 await db.commit()
 
                 write_result = await self._run_task(writer_task, db, project_id, writer_input)
@@ -135,7 +155,12 @@ class WorkerPool:
                 written_content = write_result.get("content", "")
 
                 # Reviewer
-                review_input = {"section": sec_key, "content": written_content}
+                review_input = {
+                    "section": sec_key,
+                    "content": written_content,
+                    "thesis": thesis_statement,
+                    "research_notes": section_notes,
+                }
                 reviewer_task = await self._create_task(db, project_id, "reviewer", review_input, [writer_task.id])
                 graph.add_task(reviewer_task.id, "reviewer", [writer_task.id])
                 await db.commit()
@@ -154,7 +179,12 @@ class WorkerPool:
                         graph.mark_completed(writer_task2.id)
                         written_content = write_result.get("content", written_content)
                         # Check again after revision
-                        re_review_input = {"section": sec_key, "content": written_content}
+                        re_review_input = {
+                            "section": sec_key,
+                            "content": written_content,
+                            "thesis": thesis_statement,
+                            "research_notes": section_notes,
+                        }
                         re_review_task = await self._create_task(db, project_id, "reviewer", re_review_input, [writer_task2.id])
                         graph.add_task(re_review_task.id, "reviewer", [writer_task2.id])
                         await db.commit()
@@ -253,6 +283,30 @@ class WorkerPool:
                 }
             )
         return evidence
+
+    def _build_section_notes(self, section_info: dict, summaries: list[dict], evidence: list[dict]) -> list[str]:
+        notes = []
+        section_terms = {
+            token.lower()
+            for token in str(section_info.get("title", "") + " " + section_info.get("description", "")).split()
+            if len(token) > 3
+        }
+
+        for idx, summary in enumerate(summaries[:10], 1):
+            source = summary.get("source", {})
+            title = source.get("title", "")
+            finding = summary.get("key_findings", "")
+            quantities = summary.get("quantitative_data", [])
+            blob = f"{title} {finding}".lower()
+            if section_terms and not any(term in blob for term in section_terms):
+                continue
+            quant_line = f" Quantitative evidence: {', '.join(quantities[:3])}." if quantities else ""
+            notes.append(f"[{idx}] {title}: {finding}{quant_line}")
+
+        if not notes:
+            for idx, item in enumerate(evidence[:6], 1):
+                notes.append(f"[{idx}] {item.get('title', 'Unknown')}: {item.get('abstract_excerpt', '')}")
+        return notes[:6]
 
     async def _create_task(self, db, project_id: str, agent_name: str, input_data: dict, dep_ids: list):
         from app.models import Task
