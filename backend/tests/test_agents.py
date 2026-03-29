@@ -484,3 +484,177 @@ async def test_figure_agent(db, test_project):
     )
     assert "figures" in result
     assert isinstance(result["figures"], list)
+
+
+# ---------------------------------------------------------------------------
+# New tests for quality / token-efficiency improvements
+# ---------------------------------------------------------------------------
+
+def test_truncate_text_helper():
+    from app.agents.llm_client import truncate_text
+
+    assert truncate_text("hello world", 5) == "hello…"
+    assert truncate_text("short", 100) == "short"
+    assert truncate_text("", 10) == ""
+    assert truncate_text("exactly", 7) == "exactly"
+
+
+def test_quality_max_tokens_quality_mode(monkeypatch):
+    from app.core.config import settings
+    import app.agents.llm_client as llm_module
+
+    monkeypatch.setattr(settings, "QUALITY_MODE", "quality")
+    monkeypatch.setattr(settings, "LLM_MAX_TOKENS", 4096)
+    result = llm_module.quality_max_tokens()
+    assert result == 4096
+
+
+def test_quality_max_tokens_balanced_mode(monkeypatch):
+    from app.core.config import settings
+    import app.agents.llm_client as llm_module
+
+    monkeypatch.setattr(settings, "QUALITY_MODE", "balanced")
+    monkeypatch.setattr(settings, "LLM_MAX_TOKENS", 4096)
+    result = llm_module.quality_max_tokens()
+    assert result <= 2048
+
+
+def test_find_cache_split_returns_zero_for_short_prompt():
+    from app.agents.llm_client import _find_cache_split
+
+    short = "Write an essay.\nBe concise."
+    assert _find_cache_split(short) == 0
+
+
+def test_find_cache_split_splits_long_prompt():
+    from app.agents.llm_client import _find_cache_split
+
+    context = "Background context. " * 30      # ~600 chars
+    # Task must be at least min_trailing (200 chars) from the end
+    task = "Now write the introduction section. " * 10  # ~360 chars
+    prompt = context + "\n\n" + task
+    split = _find_cache_split(prompt)
+    assert split > 0
+    assert prompt[split:].strip()  # trailing part is non-empty
+
+
+def test_research_agent_is_generic_query():
+    from app.agents.research import ResearchAgent
+
+    agent = ResearchAgent()
+    assert agent._is_generic_query("overview") is True
+    assert agent._is_generic_query("methods survey") is True
+    assert agent._is_generic_query("transformer attention mechanisms NLP 2024") is False
+
+
+def test_coherence_agent_llm_fallback_on_error(monkeypatch):
+    """_llm_coherence should return the heuristic result on LLM errors."""
+    from app.agents.coherence import CoherenceAgent
+    import app.agents.coherence as coh_module
+
+    async def fake_timed(*args, **kwargs):
+        raise RuntimeError("LLM unavailable")
+
+    monkeypatch.setattr(coh_module, "timed_chat_completion", fake_timed)
+    monkeypatch.setattr(coh_module, "is_llm_available", lambda: True)
+
+    agent = CoherenceAgent()
+    heuristic = {
+        "score": 0.8,
+        "approved": True,
+        "feedback": "ok",
+        "issues": [],
+        "suggestions": [],
+        "flagged_sections": [],
+        "repeated_opening_sections": [],
+    }
+
+    import asyncio
+    result = asyncio.get_event_loop().run_until_complete(
+        agent._llm_coherence("test topic", {"introduction": "content"}, heuristic, "pid", None)
+    )
+    assert result == heuristic
+
+
+@pytest.mark.asyncio
+async def test_coherence_agent_uses_llm_when_available(db, test_project, monkeypatch):
+    from app.agents.coherence import CoherenceAgent
+    import app.agents.coherence as coh_module
+    import json
+
+    llm_response = json.dumps({
+        "score": 0.85,
+        "approved": True,
+        "feedback": "Good overall coherence.",
+        "issues": [],
+        "suggestions": [],
+    })
+
+    async def fake_timed(*args, **kwargs):
+        return llm_response
+
+    monkeypatch.setattr(coh_module, "timed_chat_completion", fake_timed)
+    monkeypatch.setattr(coh_module, "is_llm_available", lambda: True)
+
+    agent = CoherenceAgent()
+    result = await agent.execute(
+        {
+            "topic": "machine learning",
+            "sections": {
+                "introduction": "Machine learning methods are advancing rapidly with transformer models.",
+                "conclusion": "In conclusion, machine learning, especially transformers, continue to transform the field.",
+            },
+            "quality_sections": {
+                "introduction": {"approved": True, "score": 0.85},
+                "conclusion": {"approved": True, "score": 0.82},
+            },
+        },
+        test_project.id,
+        db,
+    )
+    assert "score" in result
+    assert "approved" in result
+    assert "issues" in result
+    # Blended score should incorporate both LLM and heuristic
+    assert 0.0 <= result["score"] <= 1.0
+
+
+def test_build_section_evidence_includes_recency_bonus():
+    """Newer sources should score higher than older identical sources."""
+    from app.orchestration.worker_pool import WorkerPool
+    import time as _time
+
+    pool = WorkerPool()
+    current_year = _time.gmtime().tm_year
+
+    sources = [
+        {
+            "title": "Neural Attention Mechanisms for NLP",
+            "abstract": "attention mechanisms neural language processing overview",
+            "year": current_year - 1,   # recent
+            "source": "arxiv",
+            "relevance_score": 0.5,
+            "combined_quality_score": 0.5,
+            "verification_score": 0.6,
+        },
+        {
+            "title": "Neural Attention Mechanisms for NLP",
+            "abstract": "attention mechanisms neural language processing overview",
+            "year": current_year - 12,  # older
+            "source": "arxiv",
+            "relevance_score": 0.5,
+            "combined_quality_score": 0.5,
+            "verification_score": 0.6,
+        },
+    ]
+    section_info = {
+        "key": "literature_review",
+        "title": "Literature Review",
+        "description": "survey of neural attention mechanisms",
+        "research_queries": ["neural attention NLP"],
+        "must_cover": ["attention mechanisms"],
+    }
+    evidence = pool._build_section_evidence(section_info, sources)
+    assert evidence, "Expected at least one evidence item"
+    assert evidence[0]["year"] == current_year - 1, "Recent source should rank first"
+

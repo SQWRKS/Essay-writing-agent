@@ -1,7 +1,7 @@
 import json
 import time
 from app.agents.base import AgentBase
-from app.agents.llm_client import is_llm_available, timed_chat_completion
+from app.agents.llm_client import is_llm_available, timed_chat_completion, truncate_text, quality_max_tokens
 from app.core.config import settings
 
 
@@ -67,15 +67,15 @@ class WriterAgent(AgentBase):
             return " ".join(words[:max_words]).rstrip(".,;:") + "..."
         return cleaned.rstrip(".,;:") + "."
 
-    def _build_sources_digest(self, sources: list[dict], limit: int = 8) -> str:
+    def _build_sources_digest(self, sources: list[dict], limit: int = 5) -> str:
         lines = []
         for idx, src in enumerate(sources[:limit], 1):
             title = src.get("title", "Unknown source")
             year = src.get("year", "n.d.")
             source_name = src.get("source", "unknown")
             abstract = (src.get("abstract") or src.get("abstract_excerpt") or "").strip()
-            if len(abstract) > 120:
-                abstract = abstract[:120].rstrip() + "..."
+            if len(abstract) > 100:
+                abstract = abstract[:100].rstrip() + "…"
             lines.append(f"[{idx}] {title} ({year}, {source_name}) :: {abstract}")
         return "\n".join(lines)
 
@@ -241,10 +241,13 @@ class WriterAgent(AgentBase):
     ) -> dict:
         try:
             section_plan = section_plan or {}
-            evidence_pack = research_data.get("evidence_pack", [])[:5]
-            section_queries = research_data.get("section_queries", [])[:4]
-            research_summary = research_data.get("research_summary", "")
-            sources_summary = self._build_sources_digest(research_data.get("sources", []), limit=5)
+            # Token-efficient evidence selection: top 3 items are enough for grounding
+            evidence_pack = research_data.get("evidence_pack", [])[:3]
+            section_queries = research_data.get("section_queries", [])[:3]
+            # Truncate research summary to avoid bloating the prompt
+            research_summary = truncate_text(research_data.get("research_summary", ""), 500)
+            # Use a tighter sources digest (3 sources, 100-char abstracts)
+            sources_summary = self._build_sources_digest(research_data.get("sources", []), limit=3)
             evidence_summary = json.dumps(evidence_pack)
             thesis_goal = section_plan.get("thesis_goal", "")
             must_cover = section_plan.get("must_cover", [])
@@ -252,28 +255,25 @@ class WriterAgent(AgentBase):
             writing_directive = section_plan.get("writing_directive", "")
             subheading_hints = section_plan.get("subheading_hints", [])[:2]
             prompt = (
-                f"You are writing the '{section}' section of an academic essay on '{topic}'.\n"
-                f"Target length: approximately {word_count_target} words.\n"
-                f"Section-specific research queries: {json.dumps(section_queries)}\n\n"
-                f"Section thesis goal: {thesis_goal}\n"
-                f"Must cover:\n{self._format_list(must_cover)}\n\n"
-                f"Evidence requirements:\n{self._format_list(evidence_requirements)}\n\n"
-                f"Writing directive: {writing_directive}\n\n"
-                f"Optional subheading hints (use only if useful): {json.dumps(subheading_hints)}\n\n"
-                f"Research synthesis:\n{research_summary}\n\n"
-                f"High-priority evidence pack (JSON):\n{evidence_summary}\n\n"
-                f"Verified sources digest:\n{sources_summary}\n\n"
-                f"Revision guidance to address:\n{feedback or 'No prior revision feedback.'}\n\n"
-                "Requirements:\n"
-                "1) Produce coherent academic prose with clear logic and transitions.\n"
-                "2) Include concrete, source-grounded claims instead of generic statements.\n"
-                "3) Use inline citation markers like [1], [2] for factual claims, methods, and numbers.\n"
-                "4) Include at least one limitation or uncertainty where appropriate.\n"
-                "5) Do not invent studies or facts outside the provided evidence.\n"
-                "6) Explicitly satisfy the thesis goal and the must-cover requirements for this section.\n"
-                "7) If revision guidance is present, incorporate it directly instead of repeating the earlier draft's weaknesses.\n"
-                "8) You may include at most 2 markdown subheadings using '##' when it improves clarity.\n"
-                "Return only the final section text."
+                f"Write the '{section}' section (~{word_count_target} words) of an academic essay on '{topic}'.\n\n"
+                f"SECTION OBJECTIVE: {thesis_goal}\n"
+                f"MUST COVER: {'; '.join(str(i) for i in must_cover)}\n"
+                f"EVIDENCE REQUIREMENTS: {'; '.join(str(i) for i in evidence_requirements)}\n"
+                f"WRITING DIRECTIVE: {writing_directive}\n"
+                f"SUBHEADINGS (optional, max 2): {', '.join(subheading_hints) if subheading_hints else 'None'}\n\n"
+                f"RESEARCH SYNTHESIS:\n{research_summary}\n\n"
+                f"EVIDENCE PACK (JSON):\n{evidence_summary}\n\n"
+                f"SOURCE DIGEST:\n{sources_summary}\n\n"
+                f"REVISION GUIDANCE:\n{truncate_text(feedback, 400) if feedback else 'None'}\n\n"
+                "REQUIREMENTS:\n"
+                "1) Write coherent academic prose with clear logic and paragraph-to-paragraph transitions.\n"
+                "2) Ground every factual or analytical claim in the evidence pack; cite inline as [1], [2].\n"
+                "3) Satisfy the thesis goal and all must-cover items for this section.\n"
+                "4) Include at least one explicit limitation or uncertainty.\n"
+                "5) Do not invent studies or facts not present in the evidence pack.\n"
+                "6) If revision guidance is given, directly address each point rather than repeating prior weaknesses.\n"
+                "7) Use '## Subheading' markdown only when it improves clarity (max 2).\n"
+                "Return only the final section prose."
             )
             content = await timed_chat_completion(
                 prompt,
@@ -281,6 +281,7 @@ class WriterAgent(AgentBase):
                 agent_name=self.name,
                 log_api_call_fn=self._log_api_call,
                 temperature=0.45,
+                max_tokens=quality_max_tokens(),
             )
             return {
                 "section": section,

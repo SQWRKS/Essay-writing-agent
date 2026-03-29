@@ -4,7 +4,7 @@ import re
 import time
 import httpx
 from app.agents.base import AgentBase
-from app.agents.llm_client import is_llm_available, timed_chat_completion
+from app.agents.llm_client import is_llm_available, timed_chat_completion, truncate_text
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,12 @@ class ResearchAgent(AgentBase):
             terms.update(self._tokenize(str(chunk)))
         return terms
 
+    def _is_generic_query(self, query: str) -> bool:
+        """Return True if a query is too generic to benefit from LLM refinement."""
+        generic_suffixes = {"overview", "methods", "introduction", "review", "survey", "basics"}
+        tokens = {t.lower().strip() for t in query.split()}
+        return tokens.issubset(generic_suffixes | {""})
+
     async def execute(self, input_data: dict, project_id: str, db) -> dict:
         await self._update_agent_state(db, project_id, "running")
         queries = input_data.get("queries", [])
@@ -66,8 +72,11 @@ class ResearchAgent(AgentBase):
         if not queries and topic:
             queries = [f"{topic} overview", f"{topic} methods"]
 
-        # Use LLM to refine/expand search queries when available
-        if is_llm_available() and queries:
+        # Use LLM to refine/expand search queries only when the existing queries
+        # are short or generic — this avoids burning tokens when the planner
+        # already produced focused queries.
+        needs_refinement = len(queries) < 3 or all(self._is_generic_query(q) for q in queries[:3])
+        if is_llm_available() and queries and needs_refinement:
             queries = await self._llm_refine_queries(queries, topic, project_id, db)
 
         all_sources = []
@@ -218,16 +227,19 @@ class ResearchAgent(AgentBase):
 
     async def _llm_summarize(self, sources: list, topic: str, project_id: str, db) -> str:
         """Use LLM to synthesize a structured research summary from gathered sources."""
+        if not sources:
+            return ""
         try:
+            # Limit to 6 sources; truncate abstracts to 200 chars each to reduce prompt tokens
             sources_text = json.dumps(
                 [
                     {
                         "title": s.get("title"),
                         "year": s.get("year"),
                         "source": s.get("source"),
-                        "abstract": s.get("abstract", "")[:300],
+                        "abstract": truncate_text(s.get("abstract", ""), 200),
                     }
-                    for s in sources[:8]
+                    for s in sources[:6]
                 ]
             )
             prompt = (
@@ -243,7 +255,7 @@ class ResearchAgent(AgentBase):
                 db=db,
                 agent_name=self.name,
                 log_api_call_fn=self._log_api_call,
-                max_tokens=700,
+                max_tokens=600,
             )
         except Exception:
             return ""

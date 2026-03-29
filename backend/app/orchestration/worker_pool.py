@@ -110,7 +110,7 @@ class WorkerPool:
 
             # --- RESEARCH ---
             queries = plan.get("research_queries", [f"{topic} overview", f"{topic} methods"])
-            research_input = {"queries": queries[:6], "sources": settings.RESEARCH_SOURCES}
+            research_input = {"queries": queries[:6], "sources": settings.RESEARCH_SOURCES, "topic": topic}
             research_task = await self._create_task(db, project_id, "research", research_input, [planner_task.id])
             graph.add_task(research_task.id, "research", [planner_task.id])
             await db.commit()
@@ -609,15 +609,26 @@ class WorkerPool:
             raise
 
     def _build_section_evidence(self, section_info: dict, sources: list[dict]) -> list[dict]:
-        """Select top evidence items for a section using simple term overlap + source relevance."""
+        """Select top evidence items for a section using term overlap + source quality scores.
+
+        Scoring combines:
+        - Token overlap between section metadata/queries and source title+abstract
+        - Source combined_quality_score or relevance_score
+        - Recency bonus (sources ≤ 5 years old) for grounding freshness
+        """
         if not sources:
             return []
+
+        import time as _time
+        current_year = _time.gmtime().tm_year
 
         terms = set()
         for field in [section_info.get("key", ""), section_info.get("title", ""), section_info.get("description", "")]:
             terms.update({tok.lower() for tok in str(field).split() if len(tok) > 3})
         for query in section_info.get("research_queries", [])[:4]:
             terms.update({tok.lower() for tok in str(query).split() if len(tok) > 3})
+        for item in section_info.get("must_cover", [])[:3]:
+            terms.update({tok.lower() for tok in str(item).split() if len(tok) > 3})
 
         scored = []
         for src in sources:
@@ -627,7 +638,9 @@ class WorkerPool:
             overlap = sum(1 for term in terms if term in blob)
             base = float(src.get("combined_quality_score") or src.get("relevance_score") or 0.0)
             verification_score = float(src.get("verification_score") or 0.0)
-            score = base + (verification_score * 0.2) + min(1.0, overlap / 4.0)
+            year = src.get("year") or 0
+            recency = max(0.0, 1.0 - (max(0, current_year - int(year)) / 10.0)) if isinstance(year, int) and year > 1900 else 0.0
+            score = base + (verification_score * 0.2) + min(1.0, overlap / 4.0) + (recency * 0.1)
             scored.append((score, src))
 
         scored.sort(key=lambda item: item[0], reverse=True)
@@ -643,7 +656,7 @@ class WorkerPool:
                     "doi": src.get("doi", ""),
                     "url": src.get("url", ""),
                     "relevance_score": round(score, 3),
-                    "verification_score": round(verification_score, 3),
+                    "verification_score": round(float(src.get("verification_score") or 0.0), 3),
                     "abstract_excerpt": abstract[:320],
                     "match_reasons": src.get("match_reasons", []),
                 }

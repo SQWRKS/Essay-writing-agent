@@ -235,10 +235,21 @@ class PlannerAgent(AgentBase):
     async def _llm_plan(self, topic: str, project_id: str, db) -> dict:
         try:
             prompt = (
-                f"Create a detailed academic essay plan for the topic: '{topic}'. "
-                "Return a JSON object with keys: sections (list), research_queries (list), estimated_total_words (int). "
-                "Each section must have: key, title, description, research_queries (list of 3), word_count_target, thesis_goal, must_cover (list), evidence_requirements (list), writing_directive, include (bool), subheading_hints (list of 0-2 short strings). "
-                "Include only sections relevant to this topic. For non-empirical topics, set include=false or omit a Results section."
+                f"Create a detailed academic essay plan tailored to the topic: '{topic}'.\n\n"
+                "Return a JSON object with keys: sections (list), research_queries (list), estimated_total_words (int).\n"
+                "Each section must have:\n"
+                "  key (snake_case), title, description, research_queries (list of 3 precise academic queries),\n"
+                "  word_count_target (int), thesis_goal (what this section must argue/demonstrate),\n"
+                "  must_cover (list of 3-4 specific topics the section must address),\n"
+                "  evidence_requirements (list of 2 specific evidence expectations),\n"
+                "  writing_directive (one sentence on voice/style/argument approach),\n"
+                "  include (bool — set false for sections not applicable to this topic),\n"
+                "  subheading_hints (list of 0-2 short markdown subheading suggestions).\n\n"
+                "Guidelines:\n"
+                "- Omit or exclude the Results section for non-empirical/argumentative topics.\n"
+                "- Make research_queries specific and searchable on academic databases.\n"
+                "- Keep must_cover items concrete and topic-specific, not generic.\n"
+                "- Ensure estimated_total_words is the sum of included section word_count_targets.\n"
             )
             content = await timed_chat_completion(
                 prompt,

@@ -162,13 +162,41 @@ essay-writing-agent/
 
 | Agent | Responsibility |
 |---|---|
-| **Planner** | Breaks topic into sections, generates research queries |
-| **Research** | Queries arXiv / Semantic Scholar, returns source metadata |
-| **Verification** | Validates DOIs, metadata completeness, credibility score |
-| **Writer** | Produces academic text per section (LLM or template) |
-| **Reviewer** | Scores writing quality, returns feedback loops |
+| **Planner** | Breaks topic into sections, generates topic-specific research queries |
+| **Research** | Queries arXiv / Semantic Scholar / Crossref, refines queries with LLM when needed |
+| **Verification** | Validates DOIs, metadata completeness, LLM credibility assessment (≥5 sources) |
+| **Writer** | Produces academic text per section; token-efficient evidence grounding |
+| **Reviewer** | Scores writing quality across 5 categories, returns structured feedback |
+| **Grounding** | Checks claim-to-evidence alignment before each review |
+| **Coherence** | LLM + heuristic cross-section coherence validation |
 | **Citation** | Formats Harvard / IEEE references, bibliography |
 | **Figure** | Generates matplotlib charts, saves PNG assets |
+
+---
+
+## Quality & Token-Efficiency Features
+
+### Quality Modes
+
+Switch modes from the Dashboard or via `POST /api/config`:
+
+| Mode | Model | Revisions | Notes |
+|---|---|---|---|
+| **quality** | `claude-opus-4-6` | up to 3 per section + 3 coherence rounds | Best output, highest cost |
+| **balanced** | `claude-sonnet-4-6` | up to 2 per section + 2 coherence rounds | Good quality at ~40% lower cost |
+
+### Token Efficiency
+
+- **Anthropic prompt caching**: Long context blocks are marked `ephemeral` so repeated pipeline steps reuse the cached prefix (up to ~90 % token cost reduction on cache hits).
+- **`balanced` mode prompt ceiling**: In balanced mode, LLM completions are capped at 2 048 tokens rather than the 4 096 max, halving generation costs.
+- **Evidence pack trimming**: Each writer call uses the top 3 evidence items (not 5) with 100-char abstract excerpts — enough for grounding without token waste.
+- **Selective query refinement**: The research agent only calls the LLM to refine search queries when the planner produced fewer than 3 queries or generic ones, avoiding a full LLM round-trip on already-focused query sets.
+- **Verification LLM skip**: LLM credibility assessment is skipped when < 5 verified sources are found; the heuristic score is already reliable for small sets.
+- **Reviewer / coherence compression**: Review prompts truncate section content to 2 500 chars and coherence summaries to 300 chars per section, cutting input tokens without affecting judgment quality.
+
+### Pipeline Correctness Fix
+
+The research agent now correctly receives the essay topic from the pipeline, enabling topic-aligned query ranking and synthesis instead of falling back to empty-string matching.
 
 ---
 
@@ -179,7 +207,7 @@ cd backend
 pytest tests/ -v
 ```
 
-All 17 tests pass (7 agent unit tests + 10 endpoint integration tests).
+All 45 tests pass (29 agent unit tests + 16 endpoint integration tests).
 
 ---
 

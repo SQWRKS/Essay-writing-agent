@@ -110,8 +110,10 @@ class VerificationAgent(AgentBase):
             else:
                 rejected.append(enriched)
 
-        # Use LLM to assess credibility of verified sources when available
-        if is_llm_available() and verified:
+        # Use LLM to assess credibility only when there are enough sources to
+        # justify the API call (≥ 5 sources).  For smaller sets the heuristic
+        # verification_score is already a reliable signal.
+        if is_llm_available() and len(verified) >= 5:
             verified = await self._llm_assess_credibility(verified, project_id, db)
 
         verified.sort(
@@ -144,7 +146,11 @@ class VerificationAgent(AgentBase):
         return result
 
     async def _llm_assess_credibility(self, sources: list, project_id: str, db) -> list:
-        """Use LLM to assess and annotate source credibility."""
+        """Use LLM to assess and annotate source credibility.
+
+        Limited to the top 8 sources and truncated abstracts (150 chars) to keep
+        the prompt compact.
+        """
         try:
             sources_text = json.dumps(
                 [
@@ -152,10 +158,10 @@ class VerificationAgent(AgentBase):
                         "title": s.get("title"),
                         "authors": s.get("authors"),
                         "year": s.get("year"),
-                        "abstract": s.get("abstract", "")[:200],
+                        "abstract": (s.get("abstract", "") or "")[:150],
                         "doi": s.get("doi"),
                     }
-                    for s in sources[:10]
+                    for s in sources[:8]
                 ]
             )
             prompt = (

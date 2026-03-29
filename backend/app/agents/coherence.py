@@ -1,6 +1,8 @@
+import json
 import re
 
 from app.agents.base import AgentBase
+from app.agents.llm_client import is_llm_available, timed_chat_completion, truncate_text
 from app.core.config import settings
 
 
@@ -126,10 +128,87 @@ class CoherenceAgent(AgentBase):
 
     async def execute(self, input_data: dict, project_id: str, db) -> dict:
         await self._update_agent_state(db, project_id, "running")
-        result = self._heuristic_coherence(
-            input_data.get("topic", ""),
-            input_data.get("sections", {}),
-            input_data.get("quality_sections", {}),
-        )
+        topic = input_data.get("topic", "")
+        sections = input_data.get("sections", {})
+        quality_sections = input_data.get("quality_sections", {})
+
+        # Always run the fast heuristic check first.
+        heuristic_result = self._heuristic_coherence(topic, sections, quality_sections)
+
+        # When LLM is available, run an LLM coherence pass and merge insights.
+        if is_llm_available() and sections:
+            result = await self._llm_coherence(topic, sections, heuristic_result, project_id, db)
+        else:
+            result = heuristic_result
+
         await self._update_agent_state(db, project_id, "completed", result)
         return result
+
+    async def _llm_coherence(
+        self,
+        topic: str,
+        sections: dict[str, str],
+        heuristic: dict,
+        project_id: str,
+        db,
+    ) -> dict:
+        """Use the LLM to identify cross-section coherence issues and suggestions.
+
+        The LLM result is merged with the heuristic result: the LLM score takes
+        priority but heuristic structural flags (repeated openings, weak sections)
+        are preserved so that the pipeline can still act on them.
+        """
+        try:
+            # Build a compact section digest: first 300 chars of each section
+            section_digest = {
+                key: truncate_text(content, 300)
+                for key, content in sections.items()
+                if content
+            }
+            prompt = (
+                f"You are an academic editor reviewing the cross-section coherence of an essay on '{topic}'.\n\n"
+                "Evaluate the sections below for: (1) consistent argument thread, "
+                "(2) no repeated opening sentences, (3) smooth thematic progression, "
+                "(4) conclusion echoing the introduction's thesis.\n\n"
+                "Return a JSON object with keys:\n"
+                "  score (float 0-1), approved (bool), feedback (string, ≤2 sentences),\n"
+                "  issues (array of strings), suggestions (array of strings).\n\n"
+                f"Section openings:\n{json.dumps(section_digest)}"
+            )
+            response_text = await timed_chat_completion(
+                prompt,
+                db=db,
+                agent_name=self.name,
+                log_api_call_fn=self._log_api_call,
+                response_format={"type": "json_object"},
+                temperature=0.2,
+                max_tokens=512,
+            )
+            llm = json.loads(response_text)
+            llm_score = float(llm.get("score", heuristic["score"]))
+            # Blend: 60 % LLM, 40 % heuristic (heuristic catches structural flags)
+            blended_score = round(llm_score * 0.6 + heuristic["score"] * 0.4, 2)
+            approved = (
+                bool(llm.get("approved", False))
+                and blended_score >= settings.COHERENCE_MIN_SCORE
+                and not heuristic.get("flagged_sections")
+                and not heuristic.get("repeated_opening_sections")
+            )
+            # Merge issues and suggestions from both sources (deduplicated)
+            merged_issues = list(dict.fromkeys(
+                list(llm.get("issues", [])) + heuristic.get("issues", [])
+            ))[:5]
+            merged_suggestions = list(dict.fromkeys(
+                list(llm.get("suggestions", [])) + heuristic.get("suggestions", [])
+            ))[:5]
+            return {
+                **heuristic,
+                "score": blended_score,
+                "approved": approved,
+                "feedback": llm.get("feedback", heuristic["feedback"]),
+                "issues": merged_issues,
+                "suggestions": merged_suggestions,
+            }
+        except Exception:
+            # Fall back to heuristic result on any LLM failure
+            return heuristic

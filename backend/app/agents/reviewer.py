@@ -1,7 +1,7 @@
 import json
 import re
 from app.agents.base import AgentBase
-from app.agents.llm_client import is_llm_available, timed_chat_completion
+from app.agents.llm_client import is_llm_available, timed_chat_completion, truncate_text
 from app.core.config import settings
 
 
@@ -248,18 +248,20 @@ class ReviewerAgent(AgentBase):
                     "source": item.get("source"),
                     "relevance_score": item.get("relevance_score"),
                 }
-                for item in evidence_pack[:4]
+                for item in evidence_pack[:3]
             ])
+            # Truncate content to 2500 chars to reduce prompt tokens while
+            # still giving the reviewer enough text to evaluate quality.
             prompt = (
-                f"Review the following '{section}' section of an academic essay.\n"
-                f"Expected word count: {expected_word_count or 450}.\n"
-                f"Revision attempt: {revision_attempt}.\n"
-                "Evaluate against these categories: coverage, structure, grounding, analysis, clarity.\n"
-                "Return JSON with keys: score (0-1 float), approved (bool), feedback (string), suggestions (array), strengths (array), blocking_issues (array), category_scores (object).\n"
-                "Approval criteria: the section should be rejected if it is generic, weakly grounded, underdeveloped, or missing evidence-backed citations.\n\n"
-                f"Grounding summary:\n{json.dumps(grounding_summary)}\n\n"
-                f"Evidence pack:\n{evidence_digest}\n\n"
-                f"Content:\n{content[:3000]}"
+                f"Review the '{section}' section of an academic essay.\n"
+                f"Expected word count: {expected_word_count or 450}. Revision attempt: {revision_attempt}.\n"
+                "Score 0-1 across: coverage, structure, grounding, analysis, clarity.\n"
+                "Reject if generic, weakly grounded, underdeveloped, or lacking evidence citations.\n\n"
+                "Return JSON: score (float), approved (bool), feedback (string), "
+                "suggestions (array), strengths (array), blocking_issues (array), category_scores (object).\n\n"
+                f"Grounding summary: {json.dumps(grounding_summary)}\n"
+                f"Evidence pack: {evidence_digest}\n\n"
+                f"Content:\n{truncate_text(content, 2500)}"
             )
             response_text = await timed_chat_completion(
                 prompt,
