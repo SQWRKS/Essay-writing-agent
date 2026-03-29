@@ -30,6 +30,8 @@ FRONTEND_PORT = int(os.getenv("FRONTEND_PORT", "3000"))
 BROWSER_OPEN_DELAY: int = int(os.getenv("BROWSER_OPEN_DELAY", "3"))
 # Seconds between process health-checks in the main loop
 HEALTH_CHECK_INTERVAL: int = int(os.getenv("HEALTH_CHECK_INTERVAL", "5"))
+# Seconds to wait for a process to exit gracefully before sending SIGKILL
+SHUTDOWN_TIMEOUT: int = int(os.getenv("SHUTDOWN_TIMEOUT", "15"))
 
 
 def check_frontend_deps() -> bool:
@@ -47,6 +49,15 @@ def run() -> None:
                 os.killpg(os.getpgid(p.pid), signal.SIGTERM)
             except Exception:
                 p.terminate()
+        for p in procs:
+            try:
+                p.wait(timeout=SHUTDOWN_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                print(f"[run_app] Process {p.pid} did not stop in time; killing.")
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except Exception:
+                    p.kill()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _cleanup)
@@ -96,10 +107,11 @@ def run() -> None:
     print("[run_app] System running. Press Ctrl+C to stop.")
     try:
         while True:
-            # Restart either process if it dies unexpectedly
+            # Shut down cleanly if either process dies unexpectedly
             for p in list(procs):
                 if p.poll() is not None:
-                    print(f"[run_app] Process {p.pid} exited unexpectedly.")
+                    print(f"[run_app] Process {p.pid} exited unexpectedly. Shutting down.")
+                    _cleanup()  # raises SystemExit; not re-entered
             time.sleep(HEALTH_CHECK_INTERVAL)
     except KeyboardInterrupt:
         _cleanup()
