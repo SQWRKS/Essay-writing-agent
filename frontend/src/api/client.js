@@ -1,7 +1,11 @@
 import axios from 'axios'
 
+// VITE_API_URL can be set to an explicit backend URL (e.g. http://localhost:8000)
+// when running without a proxy.  When left empty (the default), all requests use
+// relative paths and are handled by the Vite dev-server proxy (dev) or the nginx
+// reverse-proxy (Docker/production), which avoids CORS issues entirely.
 const api = axios.create({
-  baseURL: 'http://localhost:8000',
+  baseURL: import.meta.env.VITE_API_URL ?? '',
   timeout: 30000,
   headers: {
     'Content-Type': 'application/json',
