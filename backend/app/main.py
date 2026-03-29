@@ -38,14 +38,14 @@ async def log_requests(request: Request, call_next):
     try:
         async with AsyncSessionLocal() as db:
             from app.models import ApiLog
-            from datetime import datetime
+            from datetime import datetime, timezone
             log = ApiLog(
                 endpoint=str(request.url.path),
                 method=request.method,
                 agent_name=None,
                 duration_ms=duration,
                 status_code=response.status_code,
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
             )
             db.add(log)
             await db.commit()

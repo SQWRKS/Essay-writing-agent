@@ -1,7 +1,7 @@
 import json
 import time
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,7 +37,7 @@ class AgentBase(ABC):
             agent_name=agent_name,
             duration_ms=duration_ms,
             status_code=status_code,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             metadata_json=json.dumps(metadata) if metadata else None,
         )
         db.add(log)
@@ -60,11 +60,11 @@ class AgentBase(ABC):
                 agent_name=self.name,
                 status=status,
                 last_output=json.dumps(output) if output else None,
-                updated_at=datetime.utcnow(),
+                updated_at=datetime.now(timezone.utc),
             )
             db.add(state)
         else:
             state.status = status
             state.last_output = json.dumps(output) if output else None
-            state.updated_at = datetime.utcnow()
+            state.updated_at = datetime.now(timezone.utc)
         await db.flush()

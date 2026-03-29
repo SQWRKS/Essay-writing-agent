@@ -1,7 +1,7 @@
 import json
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
@@ -27,8 +27,8 @@ async def create_project(payload: ProjectCreate, db: AsyncSession = Depends(get_
         title=payload.title,
         topic=payload.topic,
         status="pending",
-        created_at=datetime.utcnow(),
-        updated_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
     )
     db.add(project)
     await db.commit()
@@ -99,8 +99,8 @@ async def run_agent(project_id: str, payload: RunAgentRequest, db: AsyncSession 
         agent_name=payload.agent_name,
         status="running",
         input_data=json.dumps(payload.input_data),
-        created_at=datetime.utcnow(),
-        started_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
+        started_at=datetime.now(timezone.utc),
     )
     db.add(task)
     await db.flush()
@@ -110,13 +110,13 @@ async def run_agent(project_id: str, payload: RunAgentRequest, db: AsyncSession 
         output = await agent.execute(payload.input_data, project_id, db)
         task.status = "completed"
         task.output_data = json.dumps(output)
-        task.completed_at = datetime.utcnow()
+        task.completed_at = datetime.now(timezone.utc)
         await db.commit()
         return {"task_id": task.id, "status": "completed", "output": output}
     except Exception as e:
         task.status = "failed"
         task.error = str(e)
-        task.completed_at = datetime.utcnow()
+        task.completed_at = datetime.now(timezone.utc)
         await db.commit()
         raise HTTPException(status_code=500, detail=str(e))
 

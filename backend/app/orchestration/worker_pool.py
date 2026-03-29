@@ -1,6 +1,6 @@
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -20,7 +20,7 @@ class WorkerPool:
         if not project:
             return
         project.status = "running"
-        project.updated_at = datetime.utcnow()
+        project.updated_at = datetime.now(timezone.utc)
         await db.commit()
 
         await sse_manager.publish(project_id, "pipeline_start", {"project_id": project_id, "topic": topic})
@@ -130,7 +130,7 @@ class WorkerPool:
             if project:
                 project.content = json.dumps(content)
                 project.status = "completed"
-                project.updated_at = datetime.utcnow()
+                project.updated_at = datetime.now(timezone.utc)
             await db.commit()
 
             await sse_manager.publish(project_id, "pipeline_complete", {"project_id": project_id, "status": "completed"})
@@ -140,7 +140,7 @@ class WorkerPool:
             project = result.scalar_one_or_none()
             if project:
                 project.status = "failed"
-                project.updated_at = datetime.utcnow()
+                project.updated_at = datetime.now(timezone.utc)
             await db.commit()
             await sse_manager.publish(project_id, "pipeline_error", {"project_id": project_id, "error": str(e)})
             raise
@@ -154,7 +154,7 @@ class WorkerPool:
             status="pending",
             input_data=json.dumps(input_data),
             dependencies=json.dumps(dep_ids),
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
         )
         db.add(task)
         await db.flush()
@@ -169,7 +169,7 @@ class WorkerPool:
         db_task = result.scalar_one_or_none()
         if db_task:
             db_task.status = "running"
-            db_task.started_at = datetime.utcnow()
+            db_task.started_at = datetime.now(timezone.utc)
         await db.flush()
 
         await sse_manager.publish(project_id, "task_update", {
@@ -190,7 +190,7 @@ class WorkerPool:
             if db_task2:
                 db_task2.status = "completed"
                 db_task2.output_data = json.dumps(output)
-                db_task2.completed_at = datetime.utcnow()
+                db_task2.completed_at = datetime.now(timezone.utc)
             await db.flush()
 
             await sse_manager.publish(project_id, "task_update", {
@@ -205,7 +205,7 @@ class WorkerPool:
             if db_task3:
                 db_task3.status = "failed"
                 db_task3.error = str(e)
-                db_task3.completed_at = datetime.utcnow()
+                db_task3.completed_at = datetime.now(timezone.utc)
             await db.flush()
             await sse_manager.publish(project_id, "task_update", {
                 "task_id": task.id,

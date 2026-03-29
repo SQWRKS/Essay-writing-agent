@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import String, Text, DateTime, Float, Integer, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
@@ -16,8 +16,8 @@ class Project(Base):
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     topic: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="pending")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     tasks: Mapped[list["Task"]] = relationship("Task", back_populates="project", cascade="all, delete-orphan")
@@ -35,7 +35,7 @@ class Task(Base):
     input_data: Mapped[str | None] = mapped_column(Text, nullable=True)
     output_data: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     dependencies: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -51,7 +51,7 @@ class AgentState(Base):
     agent_name: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="idle")
     last_output: Mapped[str | None] = mapped_column(Text, nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
     project: Mapped["Project"] = relationship("Project", back_populates="agent_states")
 
@@ -63,7 +63,7 @@ class Output(Base):
     project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id"), nullable=False)
     output_type: Mapped[str] = mapped_column(String(20), nullable=False)
     file_path: Mapped[str] = mapped_column(String(500), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     project: Mapped["Project"] = relationship("Project", back_populates="outputs")
 
@@ -77,5 +77,5 @@ class ApiLog(Base):
     agent_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     duration_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
     status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -27,14 +27,14 @@ async def db():
 @pytest_asyncio.fixture
 async def test_project(db):
     import uuid
-    from datetime import datetime
+    from datetime import datetime, timezone
     project = Project(
         id=str(uuid.uuid4()),
         title="Agent Test Project",
         topic="machine learning",
         status="running",
-        created_at=datetime.utcnow(),
-        updated_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
     )
     db.add(project)
     await db.commit()
