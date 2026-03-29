@@ -18,7 +18,7 @@ export function useSSE(projectId) {
       esRef.current.close()
     }
 
-    const url = `${SSE_BASE_URL}/projects/${projectId}/stream`
+    const url = `${SSE_BASE_URL}/projects/${projectId}/events`
     const es = new EventSource(url)
     esRef.current = es
 

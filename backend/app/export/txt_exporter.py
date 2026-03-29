@@ -28,6 +28,21 @@ def export_project_txt(project: Project, output_dir: str) -> str:
         lines.append("")
 
     metadata = content.get("metadata", {})
+    figures = metadata.get("figures", [])
+    if figures:
+        lines.append("Figures")
+        lines.append("-" * 40)
+        for idx, fig in enumerate(figures, 1):
+            title = fig.get("title", f"Figure {idx}")
+            description = fig.get("description", "")
+            ref = fig.get("url") or fig.get("path") or ""
+            lines.append(f"{idx}. {title}")
+            if description:
+                lines.append(f"   {description}")
+            if ref:
+                lines.append(f"   {ref}")
+            lines.append("")
+
     bibliography = metadata.get("bibliography", "")
     if bibliography:
         lines.append("Bibliography")

@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { useParams } from 'react-router-dom'
-import { Save, RefreshCw, BookOpen, Quote, AlertCircle, RotateCcw } from 'lucide-react'
+import { Save, RefreshCw, BookOpen, Quote, AlertCircle, RotateCcw, Image as ImageIcon, Globe } from 'lucide-react'
+import api from '../api/client'
 import { getProject, runAgent, updateProjectContent } from '../api/client'
 import LoadingSpinner from '../components/LoadingSpinner'
 
@@ -15,27 +16,148 @@ const DEFAULT_SECTIONS = [
 ]
 
 function wordCount(text) {
-  if (!text) return 0
-  return text.trim().split(/\s+/).filter(Boolean).length
+  if (text == null) return 0
+  const normalized = typeof text === 'string' ? text : String(text)
+  if (!normalized.trim()) return 0
+  return normalized.trim().split(/\s+/).filter(Boolean).length
+}
+
+function normalizeSectionValue(value) {
+  if (value == null) return ''
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => (typeof item === 'string' ? item : JSON.stringify(item)))
+      .join('\n\n')
+  }
+  if (typeof value === 'object') {
+    if (typeof value.text === 'string') return value.text
+    if (typeof value.content === 'string') return value.content
+    return JSON.stringify(value, null, 2)
+  }
+  return String(value)
 }
 
 function parseContent(project) {
   if (!project) return {}
-  if (typeof project.content === 'object' && project.content !== null) {
-    return project.content
+  let rawContent = project.content
+
+  if (typeof rawContent === 'string') {
+    try {
+      rawContent = JSON.parse(rawContent)
+    } catch {
+      return { Introduction: rawContent }
+    }
   }
-  if (typeof project.content === 'string') {
-    try { return JSON.parse(project.content) } catch { /* ignore */ }
-    return { Introduction: project.content }
+
+  if (!rawContent || typeof rawContent !== 'object') return {}
+
+  const sectionSource =
+    rawContent.sections && typeof rawContent.sections === 'object' && !Array.isArray(rawContent.sections)
+      ? rawContent.sections
+      : rawContent
+
+  const normalized = {}
+  Object.entries(sectionSource).forEach(([key, value]) => {
+    normalized[key] = normalizeSectionValue(value)
+  })
+
+  return normalized
+}
+
+function parseContentEnvelope(project) {
+  if (!project) return { sections: {}, metadata: {} }
+
+  let rawContent = project.content
+  if (typeof rawContent === 'string') {
+    try {
+      rawContent = JSON.parse(rawContent)
+    } catch {
+      return { sections: { Introduction: rawContent }, metadata: {} }
+    }
   }
-  return {}
+
+  if (!rawContent || typeof rawContent !== 'object') return { sections: {}, metadata: {} }
+
+  const sections =
+    rawContent.sections && typeof rawContent.sections === 'object' && !Array.isArray(rawContent.sections)
+      ? rawContent.sections
+      : rawContent
+
+  const metadata = rawContent.metadata && typeof rawContent.metadata === 'object'
+    ? rawContent.metadata
+    : {}
+
+  return { sections, metadata }
+}
+
+function toSectionKey(sectionName) {
+  return String(sectionName || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
 }
 
 function parseCitations(project) {
-  if (!project?.citations) return []
-  if (Array.isArray(project.citations)) return project.citations
-  if (typeof project.citations === 'object') return Object.values(project.citations)
+  if (!project) return []
+  let content = project.content
+  if (typeof content === 'string') {
+    try {
+      content = JSON.parse(content)
+    } catch {
+      content = {}
+    }
+  }
+  const raw = content?.metadata?.citations || project?.citations
+  if (!raw) return []
+  if (Array.isArray(raw)) return raw
+  if (typeof raw === 'object') return Object.values(raw)
   return []
+}
+
+function parseFigures(project) {
+  if (!project) return []
+  let content = project.content
+  if (typeof content === 'string') {
+    try {
+      content = JSON.parse(content)
+    } catch {
+      content = {}
+    }
+  }
+  const raw = content?.metadata?.figures
+  if (!Array.isArray(raw)) return []
+  return raw
+}
+
+function parseSources(project) {
+  if (!project) return []
+  let content = project.content
+  if (typeof content === 'string') {
+    try {
+      content = JSON.parse(content)
+    } catch {
+      content = {}
+    }
+  }
+  const raw = content?.metadata?.sources
+  return Array.isArray(raw) ? raw : []
+}
+
+function toFigureUrl(pathOrUrl) {
+  if (!pathOrUrl) return ''
+  if (pathOrUrl.startsWith('http://') || pathOrUrl.startsWith('https://')) return pathOrUrl
+
+  const staticMarker = '/static/figures/'
+  const markerIndex = pathOrUrl.indexOf(staticMarker)
+  if (markerIndex >= 0) {
+    return `${api.defaults.baseURL}${pathOrUrl.slice(markerIndex)}`
+  }
+
+  if (pathOrUrl.startsWith('/')) return `${api.defaults.baseURL}${pathOrUrl}`
+  return ''
 }
 
 export default function DocumentEditor() {
@@ -49,6 +171,7 @@ export default function DocumentEditor() {
   const [saving, setSaving] = useState(false)
   const [saveMsg, setSaveMsg] = useState(null)
   const [rerunning, setRerunning] = useState(false)
+  const [metadata, setMetadata] = useState({})
 
   const fetchProject = useCallback(async () => {
     setLoading(true)
@@ -58,6 +181,8 @@ export default function DocumentEditor() {
       setProject(res.data)
       const parsed = parseContent(res.data)
       setSections(parsed)
+      const envelope = parseContentEnvelope(res.data)
+      setMetadata(envelope.metadata || {})
       if (!activeSection) {
         const first = Object.keys(parsed)[0] || DEFAULT_SECTIONS[0]
         setActiveSection(first)
@@ -69,7 +194,7 @@ export default function DocumentEditor() {
     }
   }, [id, activeSection])
 
-  useEffect(() => { fetchProject() }, [id])
+  useEffect(() => { fetchProject() }, [fetchProject])
 
   const allSections = [...new Set([
     ...DEFAULT_SECTIONS,
@@ -85,7 +210,19 @@ export default function DocumentEditor() {
     setSaving(true)
     setSaveMsg(null)
     try {
-      await updateProjectContent(id, sections)
+      const serializedSections = {}
+      Object.entries(sections).forEach(([key, value]) => {
+        const normalizedKey = toSectionKey(key)
+        serializedSections[normalizedKey || key] = normalizeSectionValue(value)
+      })
+
+      await updateProjectContent(id, {
+        sections: serializedSections,
+        metadata: {
+          ...metadata,
+          topic: metadata?.topic || project?.topic || '',
+        },
+      })
       setDirty(false)
       setSaveMsg({ type: 'success', text: 'Saved.' })
     } catch (err) {
@@ -100,8 +237,16 @@ export default function DocumentEditor() {
     setRerunning(true)
     setSaveMsg(null)
     try {
-      await runAgent(id, 'WriterAgent', { section: activeSection })
-      setSaveMsg({ type: 'success', text: `Writer agent re-queued for "${activeSection}".` })
+      await runAgent(id, 'writer', {
+        section: toSectionKey(activeSection),
+        topic: project?.topic || '',
+        word_count: Math.max(400, wordCount(activeContent) || 600),
+        research_data: {
+          sources,
+          research_summary: metadata?.research?.summary || '',
+        },
+      })
+      setSaveMsg({ type: 'success', text: `Writer agent re-run for "${activeSection}".` })
       setTimeout(fetchProject, 3000)
     } catch (err) {
       setSaveMsg({ type: 'error', text: err.message })
@@ -114,7 +259,9 @@ export default function DocumentEditor() {
   
 
   const citations = parseCitations(project)
-  const activeContent = sections[activeSection] || ''
+  const figures = parseFigures(project)
+  const sources = parseSources(project)
+  const activeContent = normalizeSectionValue(sections[activeSection])
 
   if (loading) return <div className="flex justify-center py-20"><LoadingSpinner size="lg" /></div>
   if (error) return (
@@ -237,6 +384,69 @@ export default function DocumentEditor() {
                   {typeof cit === 'string'
                     ? cit
                     : (cit.text || cit.citation || cit.reference || JSON.stringify(cit))}
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <div className="px-4 py-3 border-y border-gray-100 mt-2">
+            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider flex items-center gap-1.5">
+              <ImageIcon size={12} /> Figures
+            </p>
+          </div>
+          {figures.length === 0 ? (
+            <div className="px-4 py-6 text-center text-xs text-gray-400">
+              No figures generated yet.
+            </div>
+          ) : (
+            <ul className="p-3 space-y-3">
+              {figures.map((fig, i) => {
+                const src = toFigureUrl(fig.url || fig.path)
+                return (
+                  <li key={`${fig.title || 'fig'}-${i}`} className="text-xs bg-gray-50 rounded-lg p-3 border border-gray-100">
+                    {src && (
+                      <img
+                        src={src}
+                        alt={fig.title || `Figure ${i + 1}`}
+                        className="w-full h-auto rounded border border-gray-200 mb-2"
+                      />
+                    )}
+                    <p className="font-semibold text-gray-700">{fig.title || `Figure ${i + 1}`}</p>
+                    {fig.description && <p className="text-gray-500 mt-1">{fig.description}</p>}
+                  </li>
+                )
+              })}
+            </ul>
+          )}
+
+          <div className="px-4 py-3 border-y border-gray-100 mt-2">
+            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider flex items-center gap-1.5">
+              <Globe size={12} /> Source Provenance
+            </p>
+          </div>
+          {sources.length === 0 ? (
+            <div className="px-4 py-6 text-center text-xs text-gray-400">
+              No source metadata available yet.
+            </div>
+          ) : (
+            <ul className="p-3 space-y-2">
+              {sources.slice(0, 12).map((src, i) => (
+                <li key={`${src.doi || src.url || src.title || 'source'}-${i}`} className="text-xs bg-gray-50 rounded-lg p-3 border border-gray-100">
+                  <p className="font-semibold text-gray-700 leading-snug">{src.title || 'Untitled source'}</p>
+                  <p className="text-gray-500 mt-1">
+                    {(src.year || 'n.d.')} · {(src.source || 'unknown').replace(/_/g, ' ')}
+                    {typeof src.relevance_score === 'number' && ` · score ${src.relevance_score}`}
+                  </p>
+                  {src.url && (
+                    <a
+                      href={src.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-primary-600 hover:text-primary-800 mt-1 inline-block break-all"
+                    >
+                      {src.url}
+                    </a>
+                  )}
                 </li>
               ))}
             </ul>

@@ -32,7 +32,9 @@ class FigureAgent(AgentBase):
             ax.bar(categories, values, color=["#4C72B0", "#DD8452", "#55A868", "#C44E52"])
             ax.set_title(f"Performance Metrics - {topic[:40]}", fontsize=12)
             ax.set_ylabel("Score")
-            ax.set_ylim(0, 1.0)
+            max_value = max(values) if values else 1
+            y_max = 1.0 if max_value <= 1.0 else max_value * 1.2
+            ax.set_ylim(0, y_max)
             ax.set_xlabel("Metric")
             plt.tight_layout()
             fname = f"fig_{project_id[:8]}_{uuid.uuid4().hex[:6]}.png"
@@ -42,6 +44,8 @@ class FigureAgent(AgentBase):
             figures.append({
                 "title": f"Performance Metrics for {topic}",
                 "path": fpath,
+                "url": f"/static/figures/{fname}",
+                "section": section,
                 "description": "Bar chart showing key performance metrics.",
                 "data": {"categories": categories, "values": values},
             })
@@ -50,10 +54,11 @@ class FigureAgent(AgentBase):
             fig2, ax2 = plt.subplots(figsize=(8, 5))
             years = data.get("years", list(range(2018, 2025)))
             trend = data.get("trend", [i * 0.05 + 0.5 for i in range(len(years))])
+            trend_label = data.get("trend_label", "Relative Impact")
             ax2.plot(years, trend, marker="o", color="#4C72B0", linewidth=2)
             ax2.set_title(f"Research Trend - {topic[:40]}", fontsize=12)
             ax2.set_xlabel("Year")
-            ax2.set_ylabel("Relative Impact")
+            ax2.set_ylabel(trend_label)
             ax2.grid(True, alpha=0.3)
             plt.tight_layout()
             fname2 = f"fig_{project_id[:8]}_{uuid.uuid4().hex[:6]}_trend.png"
@@ -63,6 +68,8 @@ class FigureAgent(AgentBase):
             figures.append({
                 "title": f"Research Trend for {topic}",
                 "path": fpath2,
+                "url": f"/static/figures/{fname2}",
+                "section": section,
                 "description": "Line chart showing research trend over time.",
                 "data": {"years": years, "trend": trend},
             })

@@ -7,7 +7,7 @@ def export_project_pdf(project: Project, output_dir: str) -> str:
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image
     from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
 
     content = {}
@@ -45,6 +45,35 @@ def export_project_pdf(project: Project, output_dir: str) -> str:
                 story.append(Spacer(1, 0.1 * inch))
 
     metadata = content.get("metadata", {})
+    figures = metadata.get("figures", [])
+    if figures:
+        story.append(Spacer(1, 0.2 * inch))
+        story.append(Paragraph("Figures", heading_style))
+        for idx, fig in enumerate(figures, 1):
+            fig_title = fig.get("title", f"Figure {idx}")
+            safe_title = fig_title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            story.append(Paragraph(safe_title, body_style))
+
+            fig_path = fig.get("path", "")
+            if fig_path and os.path.exists(fig_path):
+                img = Image(fig_path)
+                img._restrictSize(6.2 * inch, 3.8 * inch)
+                story.append(Spacer(1, 0.08 * inch))
+                story.append(img)
+                story.append(Spacer(1, 0.08 * inch))
+            else:
+                ref = fig.get("url", "")
+                if ref:
+                    safe_ref = ref.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    story.append(Paragraph(f"Reference: {safe_ref}", body_style))
+                story.append(Spacer(1, 0.08 * inch))
+
+            desc = fig.get("description", "")
+            if desc:
+                safe_desc = desc.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                story.append(Paragraph(safe_desc, body_style))
+            story.append(Spacer(1, 0.12 * inch))
+
     bibliography = metadata.get("bibliography", "")
     if bibliography:
         story.append(Spacer(1, 0.2 * inch))
