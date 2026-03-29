@@ -861,3 +861,621 @@ async def test_web_search_agent_deduplicates_across_providers(db, test_project, 
     )
     assert result["total_found"] == 1
 
+
+
+# ===========================================================================
+# NLP Module Tests — non-LLM components
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 1. Preprocessor
+# ---------------------------------------------------------------------------
+
+def test_preprocessor_clean_text_removes_html():
+    from app.nlp.preprocessor import Preprocessor
+    p = Preprocessor()
+    result = p.clean_text("<p>Hello <b>world</b>!</p>")
+    assert "<" not in result
+    assert "Hello" in result
+    assert "world" in result
+
+
+def test_preprocessor_clean_text_removes_bracket_citations():
+    from app.nlp.preprocessor import Preprocessor
+    p = Preprocessor()
+    text = "Machine learning [1] is powerful [2,3]."
+    cleaned = p.clean_text(text)
+    assert "[1]" not in cleaned
+    assert "[2,3]" not in cleaned
+    assert "Machine learning" in cleaned
+
+
+def test_preprocessor_clean_text_removes_urls():
+    from app.nlp.preprocessor import Preprocessor
+    p = Preprocessor()
+    text = "See https://example.com/paper for details."
+    cleaned = p.clean_text(text)
+    assert "https://" not in cleaned
+    assert "details" in cleaned
+
+
+def test_preprocessor_chunk_text_produces_windows():
+    from app.nlp.preprocessor import Preprocessor
+    p = Preprocessor(chunk_size=10, chunk_overlap=3)
+    text = " ".join(f"word{i}" for i in range(50))
+    chunks = p.chunk_text(text)
+    assert len(chunks) > 2
+    # Each chunk should have at most chunk_size words
+    for chunk in chunks:
+        assert len(chunk.text.split()) <= p.chunk_size
+
+
+def test_preprocessor_chunk_text_overlap():
+    from app.nlp.preprocessor import Preprocessor
+    p = Preprocessor(chunk_size=6, chunk_overlap=2)
+    text = "A B C D E F G H I J K L"
+    chunks = p.chunk_text(text)
+    assert len(chunks) >= 2
+    # chunk 0 ends with words that overlap with chunk 1 start
+    w0 = chunks[0].text.split()
+    w1 = chunks[1].text.split()
+    # The last overlap words of chunk0 should appear in chunk1
+    assert w0[-1] in w1 or w0[-2] in w1  # at least 1 overlap word shared
+
+
+def test_preprocessor_detect_sections_finds_known_headings():
+    from app.nlp.preprocessor import Preprocessor
+    p = Preprocessor()
+    text = "Introduction\nThis paper examines transformers.\n\nConclusion\nIn summary, we found that transformers work."
+    sections = p.detect_sections(text)
+    assert "introduction" in sections or "conclusion" in sections
+
+
+def test_preprocessor_process_returns_document():
+    from app.nlp.preprocessor import Preprocessor, ProcessedDocument
+    p = Preprocessor()
+    doc = p.process("Hello world. This is a test.")
+    assert isinstance(doc, ProcessedDocument)
+    assert doc.cleaned_text
+    assert isinstance(doc.chunks, list)
+
+
+# ---------------------------------------------------------------------------
+# 2. ExtractiveSummarizer
+# ---------------------------------------------------------------------------
+
+def test_extractive_summarizer_reduces_text_by_at_least_70_percent():
+    from app.nlp.summarizer import ExtractiveSummarizer
+    s = ExtractiveSummarizer(max_ratio=0.3)
+    # ~600 char source
+    source = (
+        "Machine learning is a method of data analysis that automates model building. "
+        "It is based on the idea that systems can learn from data and identify patterns. "
+        "Machine learning algorithms include neural networks, decision trees, and SVMs. "
+        "Deep learning is a subset of machine learning using multilayer neural networks. "
+        "These are used in applications ranging from speech recognition to vision systems. "
+        "Recent advances in transformers have transformed natural language processing. "
+        "Large language models are pre-trained on vast text corpora to learn representations."
+    )
+    summary = s.summarize(source)
+    assert len(summary) > 0
+    assert len(summary) <= len(source) * 0.30 + 50  # tolerance for sentence boundary
+
+
+def test_extractive_summarizer_empty_input():
+    from app.nlp.summarizer import ExtractiveSummarizer
+    s = ExtractiveSummarizer()
+    assert s.summarize("") == ""
+    assert s.summarize("   ") == ""
+
+
+def test_extractive_summarizer_short_text_returns_as_is():
+    from app.nlp.summarizer import ExtractiveSummarizer
+    s = ExtractiveSummarizer()
+    short = "Short text."
+    result = s.summarize(short)
+    assert result == short or len(result) <= len(short)
+
+
+def test_extractive_summarizer_topic_bonus_prefers_relevant_sentences():
+    from app.nlp.summarizer import ExtractiveSummarizer
+    s = ExtractiveSummarizer(max_ratio=0.4, max_sentences=2)
+    text = (
+        "Renewable energy transforms electricity production from solar and wind. "
+        "The history of ancient Rome spans many centuries. "
+        "Solar panels convert photons into electricity with high efficiency. "
+        "Ancient empires rose and fell across the Mediterranean."
+    )
+    result = s.summarize(text, topic="renewable energy solar power")
+    assert "solar" in result.lower() or "renewable" in result.lower()
+
+
+def test_extractive_summarizer_summarize_many():
+    from app.nlp.summarizer import ExtractiveSummarizer
+    s = ExtractiveSummarizer(max_ratio=0.3)
+    texts = ["Short A.", "This is a longer document about machine learning and neural networks for classification."]
+    results = s.summarize_many(texts)
+    assert len(results) == 2
+
+
+# ---------------------------------------------------------------------------
+# 3. HybridRetriever
+# ---------------------------------------------------------------------------
+
+def test_hybrid_retriever_returns_top_k():
+    from app.nlp.retriever import HybridRetriever
+    r = HybridRetriever(top_k=2)
+    docs = [
+        "Machine learning trains models on data.",
+        "Quantum physics studies subatomic particles.",
+        "Neural networks learn hierarchical representations.",
+        "Ancient Rome had a complex political structure.",
+    ]
+    results = r.retrieve("neural machine learning", docs)
+    assert len(results) == 2
+    # Top result should be about ML, not Rome or quantum
+    top_text = results[0].text.lower()
+    assert any(kw in top_text for kw in ["machine", "neural", "learn"])
+
+
+def test_hybrid_retriever_scores_are_normalised():
+    from app.nlp.retriever import HybridRetriever
+    r = HybridRetriever()
+    docs = ["Dogs are mammals.", "Cats are also mammals.", "Python is a programming language."]
+    results = r.retrieve("mammals", docs, top_k=3)
+    for res in results:
+        assert 0.0 <= res.combined_score <= 1.0
+
+
+def test_hybrid_retriever_empty_corpus():
+    from app.nlp.retriever import HybridRetriever
+    r = HybridRetriever()
+    results = r.retrieve("query", [])
+    assert results == []
+
+
+def test_hybrid_retriever_returns_metadata():
+    from app.nlp.retriever import HybridRetriever
+    r = HybridRetriever(top_k=1)
+    docs = ["Machine learning is a powerful technique."]
+    meta = [{"title": "ML paper", "year": 2023}]
+    results = r.retrieve("machine learning", docs, metadata=meta)
+    assert len(results) == 1
+    assert results[0].metadata["title"] == "ML paper"
+
+
+def test_hybrid_retriever_build_index_query():
+    from app.nlp.retriever import HybridRetriever
+    r = HybridRetriever(top_k=2)
+    docs = ["Alpha beta gamma.", "Delta epsilon zeta.", "Machine learning algorithms."]
+    corpus = r.build_index(docs)
+    results = corpus.query("machine learning", top_k=1)
+    assert len(results) == 1
+    assert "machine" in results[0].text.lower() or "learning" in results[0].text.lower()
+
+
+# ---------------------------------------------------------------------------
+# 4. EssayStructureValidator
+# ---------------------------------------------------------------------------
+
+def test_structure_validator_full_essay_passes():
+    from app.nlp.validators import EssayStructureValidator
+    v = EssayStructureValidator()
+    text = (
+        "Introduction: This paper examines the role of renewable energy in modern society. "
+        "This paper argues that renewable energy is essential for sustainable development. "
+        "Firstly, solar power has grown exponentially over the past decade. "
+        "Secondly, wind energy provides low-cost electricity at scale. "
+        "Furthermore, battery storage systems complement intermittent renewables. "
+        "However, critics argue that renewable energy cannot replace baseload power. "
+        "In conclusion, renewable energy offers a viable path to a carbon-neutral future."
+    )
+    report = v.validate(text)
+    assert report.score > 0.7
+    assert report.present["introduction"]
+    assert report.present["thesis"]
+    assert report.present["arguments"]
+    assert report.present["counterargument"]
+    assert report.present["conclusion"]
+    assert len(report.missing) == 0
+
+
+def test_structure_validator_empty_text():
+    from app.nlp.validators import EssayStructureValidator
+    v = EssayStructureValidator()
+    report = v.validate("")
+    assert report.score == 0.0
+    assert "introduction" in report.missing
+
+
+def test_structure_validator_missing_conclusion():
+    from app.nlp.validators import EssayStructureValidator
+    v = EssayStructureValidator()
+    text = (
+        "This paper examines renewable energy. We argue that solar is key. "
+        "Firstly, solar is cheap. Secondly, it is clean. Furthermore, it scales. "
+        "However, critics say storage is costly."
+    )
+    report = v.validate(text)
+    assert "conclusion" in report.missing
+    assert report.score < 1.0
+
+
+def test_structure_validator_argument_count():
+    from app.nlp.validators import EssayStructureValidator
+    v = EssayStructureValidator()
+    text = "Firstly, X. Secondly, Y. Furthermore, Z."
+    report = v.validate(text)
+    assert report.argument_count >= 3
+
+
+# ---------------------------------------------------------------------------
+# 5. ReadabilityAnalyzer
+# ---------------------------------------------------------------------------
+
+def test_readability_analyzer_returns_report():
+    from app.nlp.validators import ReadabilityAnalyzer
+    a = ReadabilityAnalyzer()
+    text = "Machine learning trains models. Neural networks learn features. Deep learning scales."
+    report = a.analyze(text)
+    assert 0.0 <= report.flesch_score <= 100.0
+    assert report.avg_sentence_length > 0
+    assert 0.0 <= report.passive_voice_ratio <= 1.0
+    assert isinstance(report.grade, str)
+
+
+def test_readability_analyzer_empty_text():
+    from app.nlp.validators import ReadabilityAnalyzer
+    a = ReadabilityAnalyzer()
+    report = a.analyze("")
+    assert report.grade == "N/A"
+
+
+def test_readability_analyzer_detects_passive_voice():
+    from app.nlp.validators import ReadabilityAnalyzer
+    a = ReadabilityAnalyzer()
+    text = (
+        "The model was trained on a large dataset. "
+        "Results were evaluated using cross-validation. "
+        "The paper presents active writing."
+    )
+    report = a.analyze(text)
+    assert report.passive_voice_ratio > 0.0
+
+
+def test_readability_analyzer_long_sentences_flagged():
+    from app.nlp.validators import ReadabilityAnalyzer
+    a = ReadabilityAnalyzer()
+    # 40+ word sentence
+    long_sentence = " ".join(["word"] * 42) + "."
+    short_sentence = "This is fine."
+    report = a.analyze(f"{long_sentence} {short_sentence}")
+    assert len(report.flagged_sentences) > 0
+    assert "long" in report.flagged_sentences[0]
+
+
+# ---------------------------------------------------------------------------
+# 6. RuleBasedCritic
+# ---------------------------------------------------------------------------
+
+def test_critic_detects_repeated_phrases():
+    from app.nlp.validators import RuleBasedCritic
+    c = RuleBasedCritic(repeat_threshold=1, ngram_size=3)
+    text = "machine learning model is used. the machine learning model is effective. machine learning model shows."
+    report = c.critique(text)
+    assert any(i["type"] == "repeated_phrase" for i in report.issues)
+
+
+def test_critic_detects_weak_arguments():
+    from app.nlp.validators import RuleBasedCritic
+    c = RuleBasedCritic()
+    text = "I think this approach is better because it seems more efficient than alternatives."
+    report = c.critique(text)
+    assert any(i["type"] == "weak_argument" for i in report.issues)
+
+
+def test_critic_detects_missing_evidence():
+    from app.nlp.validators import RuleBasedCritic
+    c = RuleBasedCritic()
+    # Argumentative sentence with no evidence indicator
+    text = "Therefore this approach is superior to all other methods because it reduces cost."
+    report = c.critique(text)
+    assert any(i["type"] == "missing_evidence" for i in report.issues)
+
+
+def test_critic_clean_text_has_no_issues():
+    from app.nlp.validators import RuleBasedCritic
+    c = RuleBasedCritic()
+    report = c.critique("")
+    assert report.issue_count == 0
+    assert report.severity == "none"
+
+
+# ---------------------------------------------------------------------------
+# 7. CitationManager
+# ---------------------------------------------------------------------------
+
+def test_citation_manager_valid_source():
+    from app.nlp.citation_manager import CitationManager
+    cm = CitationManager()
+    sources = [
+        {
+            "title": "Attention Is All You Need",
+            "authors": ["Vaswani, A.", "Shazeer, N."],
+            "year": 2017,
+            "doi": "10.48550/arXiv.1706.03762",
+            "venue": "NeurIPS",
+        }
+    ]
+    citations = cm.process_sources(sources)
+    assert len(citations) == 1
+    cit = citations[0]
+    assert cit.is_valid
+    assert "Vaswani" in cit.apa
+    assert "2017" in cit.apa
+    assert "Attention" in cit.apa
+
+
+def test_citation_manager_harvard_format():
+    from app.nlp.citation_manager import CitationManager
+    cm = CitationManager()
+    sources = [
+        {
+            "title": "Deep Learning",
+            "authors": ["LeCun, Y.", "Bengio, Y.", "Hinton, G."],
+            "year": 2015,
+            "doi": "10.1038/nature14539",
+        }
+    ]
+    citations = cm.process_sources(sources)
+    assert citations[0].is_valid
+    assert "2015" in citations[0].harvard
+    assert "LeCun" in citations[0].harvard
+
+
+def test_citation_manager_invalid_source_missing_authors():
+    from app.nlp.citation_manager import CitationManager
+    cm = CitationManager()
+    sources = [{"title": "Some paper", "year": 2020, "authors": []}]
+    citations = cm.process_sources(sources)
+    assert not citations[0].is_valid
+    assert "missing authors" in citations[0].validation_issues
+
+
+def test_citation_manager_invalid_doi_flagged():
+    from app.nlp.citation_manager import CitationManager
+    cm = CitationManager()
+    sources = [{"title": "Paper", "authors": ["Smith, J."], "year": 2021, "doi": "INVALID-DOI"}]
+    citations = cm.process_sources(sources)
+    assert not citations[0].is_valid
+    assert any("DOI" in issue for issue in citations[0].validation_issues)
+
+
+def test_citation_manager_bibliography():
+    from app.nlp.citation_manager import CitationManager
+    cm = CitationManager()
+    sources = [
+        {"title": "Paper A", "authors": ["Alpha, A."], "year": 2020, "doi": "10.1000/a.1"},
+        {"title": "Paper B", "authors": ["Beta, B."], "year": 2021, "doi": "10.1000/b.2"},
+    ]
+    citations = cm.process_sources(sources)
+    bib = cm.bibliography(citations, style="apa")
+    assert "Alpha" in bib
+    assert "Beta" in bib
+
+
+def test_citation_manager_validate_fields():
+    from app.nlp.citation_manager import CitationManager
+    cm = CitationManager()
+    sources = [
+        {"title": "Good", "authors": ["A, B."], "year": 2020, "doi": "10.1000/x.1"},
+        {"title": "", "authors": [], "year": 9999},
+    ]
+    valid, invalid = cm.validate_fields(sources)
+    assert len(valid) == 1
+    assert len(invalid) == 1
+
+
+# ---------------------------------------------------------------------------
+# 8. KeywordFilter
+# ---------------------------------------------------------------------------
+
+def test_keyword_filter_extracts_keywords():
+    from app.nlp.keyword_filter import KeywordFilter
+    kf = KeywordFilter()
+    keywords = kf.extract_keywords("machine learning neural networks")
+    assert "machine" in keywords or "learning" in keywords or "neural" in keywords
+
+
+def test_keyword_filter_score_sentence():
+    from app.nlp.keyword_filter import KeywordFilter
+    kf = KeywordFilter()
+    keywords = ["machine", "learning", "neural"]
+    score = kf.score_sentence("Machine learning uses neural networks.", keywords)
+    assert score > 0.0
+
+
+def test_keyword_filter_filter_sentences_removes_irrelevant():
+    from app.nlp.keyword_filter import KeywordFilter
+    kf = KeywordFilter(threshold=0.1)
+    text = (
+        "Machine learning trains models on data. "
+        "Ancient Rome had many emperors. "
+        "Neural networks learn representations."
+    )
+    filtered = kf.filter_sentences(text, ["machine", "learning", "neural", "networks"])
+    assert "Machine learning" in filtered or "Neural" in filtered
+    # Rome sentence should be filtered
+    assert "Rome" not in filtered
+
+
+def test_keyword_filter_filter_sources():
+    from app.nlp.keyword_filter import KeywordFilter
+    kf = KeywordFilter(threshold=0.05)
+    sources = [
+        {"title": "ML paper", "abstract": "Machine learning trains neural network models."},
+        {"title": "History paper", "abstract": "Ancient Roman history spanning centuries."},
+        {"title": "No abstract", "abstract": ""},
+    ]
+    filtered = kf.filter_sources(sources, "machine learning neural")
+    titles = [s["title"] for s in filtered]
+    assert "ML paper" in titles
+    # Sources without abstract are always kept
+    assert "No abstract" in titles
+
+
+def test_keyword_filter_empty_topic_returns_all():
+    from app.nlp.keyword_filter import KeywordFilter
+    kf = KeywordFilter()
+    sources = [
+        {"title": "A", "abstract": "Some content."},
+        {"title": "B", "abstract": "Other content."},
+    ]
+    filtered = kf.filter_sources(sources, "")
+    assert len(filtered) == 2
+
+
+# ---------------------------------------------------------------------------
+# 9. CacheManager
+# ---------------------------------------------------------------------------
+
+def test_cache_manager_set_and_get(tmp_path):
+    from app.nlp.cache_manager import CacheManager
+    cache = CacheManager(db_path=tmp_path / "test.db", namespace="test")
+    cache.set("key1", {"data": "value"})
+    result = cache.get("key1")
+    assert result == {"data": "value"}
+
+
+def test_cache_manager_missing_key_returns_none(tmp_path):
+    from app.nlp.cache_manager import CacheManager
+    cache = CacheManager(db_path=tmp_path / "test.db", namespace="test")
+    assert cache.get("nonexistent") is None
+
+
+def test_cache_manager_ttl_expiry(tmp_path):
+    import time
+    from app.nlp.cache_manager import CacheManager
+    cache = CacheManager(db_path=tmp_path / "test.db", namespace="test", default_ttl=0.01)
+    cache.set("expiring", "value")
+    time.sleep(0.05)
+    assert cache.get("expiring") is None
+
+
+def test_cache_manager_exists(tmp_path):
+    from app.nlp.cache_manager import CacheManager
+    cache = CacheManager(db_path=tmp_path / "test.db", namespace="test")
+    assert not cache.exists("k")
+    cache.set("k", 42)
+    assert cache.exists("k")
+
+
+def test_cache_manager_delete(tmp_path):
+    from app.nlp.cache_manager import CacheManager
+    cache = CacheManager(db_path=tmp_path / "test.db", namespace="test")
+    cache.set("to_delete", "hello")
+    cache.delete("to_delete")
+    assert cache.get("to_delete") is None
+
+
+def test_cache_manager_clear_namespace(tmp_path):
+    from app.nlp.cache_manager import CacheManager
+    cache = CacheManager(db_path=tmp_path / "test.db", namespace="ns1")
+    cache.set("a", 1)
+    cache.set("b", 2)
+    cache.clear_namespace()
+    assert cache.get("a") is None
+    assert cache.get("b") is None
+
+
+def test_cache_manager_cache_key():
+    from app.nlp.cache_manager import CacheManager
+    cache = CacheManager(namespace="test")
+    key = cache.cache_key("search", "topic", "query")
+    assert key == "search|topic|query"
+
+
+# ---------------------------------------------------------------------------
+# 10. NLPPipeline integration
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_nlp_pipeline_preprocess_sources():
+    from app.nlp.pipeline import NLPPipeline
+    pipeline = NLPPipeline(cache_ttl=None)
+    sources = [
+        {
+            "title": "Machine Learning Overview",
+            "abstract": (
+                "Machine learning is a method of data analysis that automates model building. "
+                "It is based on the idea that systems can learn from data and identify patterns. "
+                "Deep learning is a subfield that uses multilayer neural networks. "
+                "Applications include computer vision, natural language processing, and robotics. "
+                "Transformers have become the dominant architecture for language tasks."
+            ),
+            "source": "arxiv",
+        },
+        {
+            "title": "Ancient History",
+            "abstract": "Ancient Rome had emperors and legions spanning the Mediterranean.",
+            "source": "web",
+        },
+    ]
+    enriched = await pipeline.preprocess_sources(sources, "machine learning neural networks")
+    assert len(enriched) == 2
+    # All sources should have the new field
+    for src in enriched:
+        assert "processed_abstract" in src
+    # The ML source should have a non-empty processed abstract
+    ml_src = next(s for s in enriched if "Machine" in s["title"])
+    assert ml_src["processed_abstract"]
+
+
+@pytest.mark.asyncio
+async def test_nlp_pipeline_analyze_essay():
+    from app.nlp.pipeline import NLPPipeline
+    pipeline = NLPPipeline(cache_ttl=None)
+    sections = {
+        "introduction": (
+            "This paper examines renewable energy. We argue that solar energy is key. "
+            "Firstly, solar is abundant. Secondly, it is clean. Furthermore, it is cheap. "
+            "However, critics argue storage remains costly. In conclusion, solar is essential."
+        ),
+        "conclusion": "In conclusion, renewable energy, especially solar, is transformative.",
+    }
+    analysis = await pipeline.analyze_essay(sections, "renewable energy")
+    assert "structure" in analysis
+    assert "readability" in analysis
+    assert "critic" in analysis
+    # Structure check
+    struct = analysis["structure"]
+    assert "score" in struct
+    assert 0.0 <= struct["score"] <= 1.0
+
+
+def test_nlp_pipeline_validate_citations():
+    from app.nlp.pipeline import NLPPipeline
+    pipeline = NLPPipeline(cache_ttl=None)
+    sources = [
+        {"title": "Paper A", "authors": ["Smith, J."], "year": 2021, "doi": "10.1000/a.1"},
+        {"title": "Invalid", "authors": [], "year": 0},
+    ]
+    result = pipeline.validate_citations(sources, style="apa")
+    assert result["valid_count"] == 1
+    assert result["invalid_count"] == 1
+    assert len(result["citations"]) == 2
+    assert result["bibliography"]
+
+
+def test_nlp_pipeline_retrieve_top_chunks():
+    from app.nlp.pipeline import NLPPipeline
+    pipeline = NLPPipeline(cache_ttl=None)
+    sources = [
+        {"title": "ML", "abstract": "Machine learning models learn from data.", "processed_abstract": "Machine learning models learn from data."},
+        {"title": "History", "abstract": "Ancient history spans millennia.", "processed_abstract": "Ancient history spans millennia."},
+        {"title": "DL", "abstract": "Deep learning uses neural networks.", "processed_abstract": "Deep learning uses neural networks."},
+    ]
+    top = pipeline.retrieve_top_chunks("machine learning neural", sources, top_k=2)
+    assert len(top) == 2
+    titles = [s["title"] for s in top]
+    assert "ML" in titles or "DL" in titles

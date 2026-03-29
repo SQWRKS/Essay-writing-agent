@@ -10,8 +10,13 @@ from sqlalchemy import select
 from app.orchestration.task_graph import TaskGraph
 from app.core.sse import sse_manager
 from app.core.config import settings
+from app.nlp.pipeline import NLPPipeline
 
 logger = logging.getLogger(__name__)
+
+# Shared NLP pipeline instance (one per process; all components are stateless
+# between calls and the CacheManager connection is thread-safe)
+_nlp_pipeline = NLPPipeline()
 
 # Maximum number of queries forwarded to the WebSearchAgent per pipeline run
 _WS_QUERY_LIMIT = 4
@@ -180,6 +185,17 @@ class WorkerPool:
             ws_count = len(web_search_result.get("sources", [])) if web_search_result else 0
             if ws_count:
                 merged_breakdown["web_search"] = ws_count
+
+            # --- NLP PREPROCESSING (non-LLM, parallel) ---
+            # Cleans, summarises and keyword-filters each source abstract
+            # before passing to the LLM writer.  Runs in a thread-pool so
+            # it does not block the async event loop.
+            try:
+                all_sources = await _nlp_pipeline.preprocess_sources(
+                    all_sources, topic, queries=queries
+                )
+            except Exception as _nlp_err:
+                logger.warning("NLP source preprocessing failed (non-fatal): %s", _nlp_err)
 
             content["metadata"]["research"] = {
                 "queries": queries,
@@ -614,6 +630,15 @@ class WorkerPool:
             content["metadata"]["quality"]["summary"]["coherence_revision_rounds"] = coherence_round
             content["metadata"]["quality"]["summary"]["coherence_stop_reason"] = coherence_stop_reason
 
+            # --- NLP ESSAY ANALYSIS (non-LLM) ---
+            # Run after all sections are finalised.  Adds structure, readability,
+            # and critic reports to metadata without making any LLM calls.
+            try:
+                nlp_analysis = await _nlp_pipeline.analyze_essay(content["sections"], topic)
+                content["metadata"]["nlp_analysis"] = nlp_analysis
+            except Exception as _nlp_err:
+                logger.warning("NLP essay analysis failed (non-fatal): %s", _nlp_err)
+
             # --- CITATION ---
             citation_input = {"sources": verified_sources, "style": "harvard"}
             citation_task = await self._create_task(db, project_id, "citation", citation_input, [*writer_task_ids, coherence_task.id])
@@ -624,6 +649,13 @@ class WorkerPool:
             graph.mark_completed(citation_task.id)
             content["metadata"]["citations"] = citation_result.get("formatted_citations", [])
             content["metadata"]["bibliography"] = citation_result.get("bibliography", "")
+
+            # NLP citation validation (no LLM — validates fields + reformats)
+            try:
+                nlp_citations = _nlp_pipeline.validate_citations(verified_sources, style="harvard")
+                content["metadata"].setdefault("nlp_analysis", {})["citations"] = nlp_citations
+            except Exception as _nlp_err:
+                logger.warning("NLP citation validation failed (non-fatal): %s", _nlp_err)
 
             # --- FIGURE ---
             figure_input = {
