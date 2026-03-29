@@ -1,0 +1,44 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment files (contain secrets)
+.env
+
+# SQLite database files
+*.db
+*.sqlite3
+
+# Export output directories
+backend/static/exports/
+backend/static/figures/
+/tmp/figures/
+
+# pytest cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node / frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Editor / OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+
+# Docker
+.dockerignore
