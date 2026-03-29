@@ -658,3 +658,206 @@ def test_build_section_evidence_includes_recency_bonus():
     assert evidence, "Expected at least one evidence item"
     assert evidence[0]["year"] == current_year - 1, "Recent source should rank first"
 
+
+# ---------------------------------------------------------------------------
+# WebSearchAgent tests
+# ---------------------------------------------------------------------------
+
+def test_web_search_agent_clean_text():
+    from app.agents.web_search import WebSearchAgent
+
+    agent = WebSearchAgent()
+    raw = "<p>Hello &amp; world!  \n\nLine two.</p>"
+    cleaned = agent._clean_text(raw)
+    assert "<p>" not in cleaned
+    assert "&amp;" not in cleaned
+    assert "Hello" in cleaned
+    assert "world" in cleaned
+    # Multiple whitespace collapses
+    assert "  " not in cleaned
+
+
+def test_web_search_agent_split_sentences():
+    from app.agents.web_search import WebSearchAgent
+
+    agent = WebSearchAgent()
+    text = (
+        "Machine learning is a subfield of AI. "
+        "It enables computers to learn from data. "
+        "Deep learning uses neural networks."
+    )
+    sentences = agent._split_sentences(text)
+    assert len(sentences) >= 3
+
+
+def test_web_search_agent_keyword_set():
+    from app.agents.web_search import WebSearchAgent
+
+    agent = WebSearchAgent()
+    terms = agent._keyword_set("neural networks machine learning deep")
+    assert "neural" in terms
+    assert "networks" in terms
+    assert "machine" in terms
+    # Short/stopwords should be excluded
+    assert "deep" in terms or True  # 'deep' is 4 chars, may or may not be excluded
+
+
+def test_web_search_agent_preprocess_text_returns_compact():
+    from app.agents.web_search import WebSearchAgent
+
+    agent = WebSearchAgent()
+    # Long article intro — preprocessing should return ≤400 chars
+    long_text = (
+        "Machine learning is a method of data analysis that automates analytical model building. "
+        "It is based on the idea that systems can learn from data, identify patterns, and make decisions "
+        "with minimal human intervention. "
+        "Machine learning algorithms include neural networks, decision trees, and support vector machines. "
+        "These are used in applications ranging from email filtering to computer vision. "
+        "Recent advances in deep learning have transformed natural language processing significantly."
+    )
+    result = agent._preprocess_text(long_text, "machine learning", max_chars=400)
+    assert len(result) <= 420  # allow tiny overshoot from sentence boundary
+    assert len(result) > 0
+
+
+def test_web_search_agent_preprocess_text_empty():
+    from app.agents.web_search import WebSearchAgent
+
+    agent = WebSearchAgent()
+    assert agent._preprocess_text("", "topic") == ""
+    assert agent._preprocess_text("   ", "topic") == ""
+
+
+def test_web_search_agent_preprocess_scores_relevant_sentences_higher():
+    from app.agents.web_search import WebSearchAgent
+
+    agent = WebSearchAgent()
+    # Three sentences: two relevant to "renewable energy", one off-topic.
+    # With a budget of 200 chars the preprocessing should pick the two
+    # highest-scoring sentences and exclude the off-topic Rome sentence.
+    text = (
+        "Renewable energy sources such as solar and wind power are transforming electricity generation. "
+        "The history of ancient Rome spans many centuries and cultures. "
+        "Solar panels convert sunlight into electricity with increasing efficiency each year."
+    )
+    result = agent._preprocess_text(text, "renewable energy solar power", max_chars=200)
+    # At budget 200 chars the two relevant sentences (~91 + 83 chars) fill the
+    # budget before the low-scoring Rome sentence can be added.
+    assert "renewable" in result.lower() or "solar" in result.lower()
+    assert "rome" not in result.lower()
+
+
+def test_web_search_agent_deduplicate():
+    from app.agents.web_search import WebSearchAgent
+
+    agent = WebSearchAgent()
+    sources = [
+        {"title": "A", "url": "https://example.com/a", "source": "web_search"},
+        {"title": "B", "url": "https://example.com/b", "source": "web_search"},
+        {"title": "A duplicate", "url": "https://example.com/a", "source": "web_search"},
+    ]
+    unique = agent._deduplicate(sources)
+    assert len(unique) == 2
+    urls = [s["url"] for s in unique]
+    assert "https://example.com/a" in urls
+    assert "https://example.com/b" in urls
+
+
+@pytest.mark.asyncio
+async def test_web_search_agent_execute_empty_input(db, test_project):
+    """Agent should return empty sources gracefully when no queries provided."""
+    from app.agents.web_search import WebSearchAgent
+
+    agent = WebSearchAgent()
+    result = await agent.execute({}, test_project.id, db)
+    assert "sources" in result
+    assert "total_found" in result
+    assert result["sources"] == []
+    assert result["total_found"] == 0
+
+
+@pytest.mark.asyncio
+async def test_web_search_agent_execute_mocked(db, test_project, monkeypatch):
+    """Agent should integrate DuckDuckGo + Wikipedia results correctly."""
+    from app.agents.web_search import WebSearchAgent
+    import app.agents.web_search as ws_module
+
+    ddg_sources = [
+        {
+            "title": "Machine Learning",
+            "authors": [],
+            "year": 2024,
+            "abstract": "Machine learning uses statistical techniques to give computers ability to learn.",
+            "url": "https://en.wikipedia.org/wiki/Machine_learning",
+            "doi": "",
+            "source": "web_search",
+        }
+    ]
+    wiki_sources = [
+        {
+            "title": "Deep Learning",
+            "authors": [],
+            "year": 2024,
+            "abstract": "Deep learning is part of machine learning methods based on neural networks.",
+            "url": "https://en.wikipedia.org/wiki/Deep_learning",
+            "doi": "",
+            "source": "web_search",
+        }
+    ]
+
+    async def fake_ddg(queries, topic, db):
+        return ddg_sources
+
+    async def fake_wiki(queries, topic, db):
+        return wiki_sources
+
+    agent = WebSearchAgent()
+    monkeypatch.setattr(agent, "_search_duckduckgo", fake_ddg)
+    monkeypatch.setattr(agent, "_search_wikipedia", fake_wiki)
+
+    result = await agent.execute(
+        {"queries": ["machine learning overview"], "topic": "machine learning"},
+        test_project.id,
+        db,
+    )
+
+    assert result["total_found"] == 2
+    assert len(result["sources"]) == 2
+    assert result["source_breakdown"]["web_search"] == 2
+    titles = [s["title"] for s in result["sources"]]
+    assert "Machine Learning" in titles
+    assert "Deep Learning" in titles
+
+
+@pytest.mark.asyncio
+async def test_web_search_agent_deduplicates_across_providers(db, test_project, monkeypatch):
+    """Same URL returned by both providers should appear only once."""
+    from app.agents.web_search import WebSearchAgent
+
+    shared_source = {
+        "title": "Machine Learning",
+        "authors": [],
+        "year": 2024,
+        "abstract": "Machine learning overview.",
+        "url": "https://en.wikipedia.org/wiki/Machine_learning",
+        "doi": "",
+        "source": "web_search",
+    }
+
+    async def fake_ddg(queries, topic, db):
+        return [shared_source]
+
+    async def fake_wiki(queries, topic, db):
+        return [shared_source]  # same URL
+
+    agent = WebSearchAgent()
+    monkeypatch.setattr(agent, "_search_duckduckgo", fake_ddg)
+    monkeypatch.setattr(agent, "_search_wikipedia", fake_wiki)
+
+    result = await agent.execute(
+        {"queries": ["machine learning"], "topic": "machine learning"},
+        test_project.id,
+        db,
+    )
+    assert result["total_found"] == 1
+

@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 import time
 import uuid
 from datetime import datetime, timezone
@@ -8,6 +10,11 @@ from sqlalchemy import select
 from app.orchestration.task_graph import TaskGraph
 from app.core.sse import sse_manager
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+# Maximum number of queries forwarded to the WebSearchAgent per pipeline run
+_WS_QUERY_LIMIT = 4
 
 
 class PipelinePausedError(RuntimeError):
@@ -108,20 +115,76 @@ class WorkerPool:
             graph.mark_completed(planner_task.id)
             plan = plan_result or {}
 
-            # --- RESEARCH ---
+            # --- RESEARCH + WEB SEARCH (parallel) ---
             queries = plan.get("research_queries", [f"{topic} overview", f"{topic} methods"])
             research_input = {"queries": queries[:6], "sources": settings.RESEARCH_SOURCES, "topic": topic}
             research_task = await self._create_task(db, project_id, "research", research_input, [planner_task.id])
             graph.add_task(research_task.id, "research", [planner_task.id])
+
+            # Create the web_search task record before the gather so it appears
+            # in the task list immediately, even while it's still pending.
+            ws_input = {"queries": queries[:_WS_QUERY_LIMIT], "topic": topic}
+            ws_task = None
+            if settings.WEB_SEARCH_ENABLED:
+                ws_task = await self._create_task(db, project_id, "web_search", ws_input, [planner_task.id])
+                graph.add_task(ws_task.id, "web_search", [planner_task.id])
+
             await db.commit()
 
-            research_result = await self._run_task(research_task, db, project_id, research_input)
-            graph.mark_completed(research_task.id)
+            # Build coroutines: research always runs; web_search only when enabled
+            if settings.WEB_SEARCH_ENABLED and ws_task is not None:
+                # Research uses the main session; web_search uses its own session
+                # so the two coroutines never share session state.
+                research_outcome, ws_outcome = await asyncio.gather(
+                    self._run_task(research_task, db, project_id, research_input),
+                    self._run_agent_in_fresh_session(ws_task.id, "web_search", ws_input, project_id),
+                    return_exceptions=True,
+                )
+                # Research failure is fatal; web_search failure is non-fatal
+                if isinstance(research_outcome, BaseException):
+                    raise research_outcome
+                research_result = research_outcome
+                graph.mark_completed(research_task.id)
+
+                if isinstance(ws_outcome, BaseException):
+                    logger.warning("WebSearchAgent failed (non-fatal): %s", ws_outcome)
+                    web_search_result: dict = {}
+                else:
+                    web_search_result = ws_outcome
+                    graph.mark_completed(ws_task.id)
+            else:
+                research_result = await self._run_task(research_task, db, project_id, research_input)
+                graph.mark_completed(research_task.id)
+                web_search_result = {}
+
+            # Merge web search sources into the academic source pool
+            all_sources = list(research_result.get("sources", []))
+            if web_search_result:
+                ws_sources = web_search_result.get("sources", [])
+                existing_keys = {
+                    (s.get("doi") or "").rstrip("/") or (s.get("url") or "").rstrip("/") or s.get("title", "")
+                    for s in all_sources
+                }
+                added = 0
+                for ws in ws_sources:
+                    key = (ws.get("url") or "").rstrip("/") or ws.get("title", "")
+                    if key and key not in existing_keys:
+                        all_sources.append(ws)
+                        existing_keys.add(key)
+                        added += 1
+                if added:
+                    logger.info("WebSearchAgent added %d new sources to the research pool", added)
+
+            # Build merged source breakdown for metadata
+            merged_breakdown = dict(research_result.get("source_breakdown", {}))
+            ws_count = len(web_search_result.get("sources", [])) if web_search_result else 0
+            if ws_count:
+                merged_breakdown["web_search"] = ws_count
 
             content["metadata"]["research"] = {
                 "queries": queries,
-                "source_breakdown": research_result.get("source_breakdown", {}),
-                "total_found": research_result.get("total_found", 0),
+                "source_breakdown": merged_breakdown,
+                "total_found": len(all_sources),
                 "summary": research_result.get("summary", ""),
                 "top_sources": [
                     {
@@ -131,12 +194,12 @@ class WorkerPool:
                         "relevance_score": source.get("relevance_score", 0.0),
                         "match_reasons": source.get("match_reasons", []),
                     }
-                    for source in research_result.get("sources", [])[:5]
+                    for source in all_sources[:5]
                 ],
             }
 
             # --- VERIFICATION ---
-            verify_input = {"sources": research_result.get("sources", [])}
+            verify_input = {"sources": all_sources}
             verify_task = await self._create_task(db, project_id, "verification", verify_input, [research_task.id])
             graph.add_task(verify_task.id, "verification", [research_task.id])
             await db.commit()
@@ -662,6 +725,73 @@ class WorkerPool:
                 }
             )
         return evidence
+
+    async def _run_agent_in_fresh_session(
+        self, task_id: str, agent_name: str, input_data: dict, project_id: str
+    ) -> dict:
+        """Run an agent in its own DB session.
+
+        This allows two agents to execute concurrently with ``asyncio.gather``
+        without sharing a SQLAlchemy session (which is not concurrency-safe).
+        The method mirrors ``_run_task`` but opens a fresh
+        ``AsyncSessionLocal`` session so no session state is shared with the
+        caller's session.
+        """
+        from app.database import AsyncSessionLocal
+        from app.agents import AGENT_REGISTRY
+        from app.models import Task
+        from sqlalchemy import select as sel
+
+        async with AsyncSessionLocal() as session:
+            # Mark task as running
+            task_row = (await session.execute(sel(Task).where(Task.id == task_id))).scalar_one_or_none()
+            if task_row:
+                task_row.status = "running"
+                task_row.started_at = datetime.now(timezone.utc)
+            await session.commit()
+
+            await sse_manager.publish(project_id, "task_update", {
+                "task_id": task_id,
+                "status": "running",
+                "agent": agent_name,
+            })
+
+            agent_cls = AGENT_REGISTRY.get(agent_name)
+            if not agent_cls:
+                raise ValueError(f"Unknown agent: {agent_name}")
+
+            agent = agent_cls()
+            try:
+                output = await agent.execute(input_data, project_id, session)
+
+                task_row2 = (await session.execute(sel(Task).where(Task.id == task_id))).scalar_one_or_none()
+                if task_row2:
+                    task_row2.status = "completed"
+                    task_row2.output_data = json.dumps(output)
+                    task_row2.completed_at = datetime.now(timezone.utc)
+                await session.commit()
+
+                await sse_manager.publish(project_id, "task_update", {
+                    "task_id": task_id,
+                    "status": "completed",
+                    "agent": agent_name,
+                })
+                return output
+            except Exception as exc:
+                task_row3 = (await session.execute(sel(Task).where(Task.id == task_id))).scalar_one_or_none()
+                if task_row3:
+                    task_row3.status = "failed"
+                    task_row3.error = str(exc)
+                    task_row3.completed_at = datetime.now(timezone.utc)
+                await session.commit()
+
+                await sse_manager.publish(project_id, "task_update", {
+                    "task_id": task_id,
+                    "status": "failed",
+                    "agent": agent_name,
+                    "error": str(exc),
+                })
+                raise
 
     async def _create_task(self, db, project_id: str, agent_name: str, input_data: dict, dep_ids: list):
         from app.models import Task

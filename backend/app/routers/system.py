@@ -69,6 +69,7 @@ async def get_config():
         LLM_TEMPERATURE=settings.LLM_TEMPERATURE,
         LLM_MAX_TOKENS=settings.LLM_MAX_TOKENS,
         RESEARCH_SOURCES=settings.RESEARCH_SOURCES,
+        WEB_SEARCH_ENABLED=settings.WEB_SEARCH_ENABLED,
         LOG_LEVEL=settings.LOG_LEVEL,
         BACKEND_PORT=settings.BACKEND_PORT,
         FRONTEND_PORT=settings.FRONTEND_PORT,
@@ -127,6 +128,8 @@ async def update_config(payload: ConfigUpdate):
         settings.LLM_MAX_TOKENS = payload.LLM_MAX_TOKENS
     if payload.RESEARCH_SOURCES is not None:
         settings.RESEARCH_SOURCES = payload.RESEARCH_SOURCES
+    if payload.WEB_SEARCH_ENABLED is not None:
+        settings.WEB_SEARCH_ENABLED = payload.WEB_SEARCH_ENABLED
     if payload.MAX_REVISION_ATTEMPTS is not None:
         settings.MAX_REVISION_ATTEMPTS = payload.MAX_REVISION_ATTEMPTS
     if payload.SECTION_SCORE_TARGET is not None:

@@ -7,10 +7,12 @@ from app.agents.reviewer import ReviewerAgent
 from app.agents.coherence import CoherenceAgent
 from app.agents.citation import CitationAgent
 from app.agents.figure import FigureAgent
+from app.agents.web_search import WebSearchAgent
 
 AGENT_REGISTRY = {
     "planner": PlannerAgent,
     "research": ResearchAgent,
+    "web_search": WebSearchAgent,
     "verification": VerificationAgent,
     "writer": WriterAgent,
     "grounding": GroundingAgent,

@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     LLM_MAX_TOKENS: int = 4096
 
     RESEARCH_SOURCES: List[str] = ["arxiv", "semantic_scholar", "web"]
+    # Enable the non-LLM web search agent (DuckDuckGo + Wikipedia).
+    # When True the agent runs in parallel with the academic research agent
+    # and its sources are merged into the pipeline before verification.
+    WEB_SEARCH_ENABLED: bool = True
     LOG_LEVEL: str = "INFO"
     BACKEND_PORT: int = 8000
     FRONTEND_PORT: int = 3000

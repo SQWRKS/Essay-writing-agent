@@ -81,6 +81,7 @@ class ConfigRead(BaseModel):
     LLM_TEMPERATURE: float
     LLM_MAX_TOKENS: int
     RESEARCH_SOURCES: List[str]
+    WEB_SEARCH_ENABLED: bool
     LOG_LEVEL: str
     BACKEND_PORT: int
     FRONTEND_PORT: int
@@ -104,6 +105,7 @@ class ConfigUpdate(BaseModel):
     LLM_TEMPERATURE: Optional[float] = None
     LLM_MAX_TOKENS: Optional[int] = None
     RESEARCH_SOURCES: Optional[List[str]] = None
+    WEB_SEARCH_ENABLED: Optional[bool] = None
     MAX_REVISION_ATTEMPTS: Optional[int] = None
     SECTION_SCORE_TARGET: Optional[float] = None
     COHERENCE_SCORE_TARGET: Optional[float] = None
