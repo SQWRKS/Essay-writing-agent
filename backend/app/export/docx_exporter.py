@@ -3,6 +3,14 @@ import os
 from app.models import Project
 
 
+def _coerce_section_content(section_payload):
+    if isinstance(section_payload, dict):
+        return str(section_payload.get("content") or "")
+    if isinstance(section_payload, str):
+        return section_payload
+    return str(section_payload or "")
+
+
 def export_project_docx(project: Project, output_dir: str) -> str:
     from docx import Document
     from docx.shared import Inches
@@ -28,10 +36,16 @@ def export_project_docx(project: Project, output_dir: str) -> str:
     for sec_key, sec_content in sections.items():
         heading = sec_key.replace("_", " ").title()
         doc.add_heading(heading, level=1)
-        for para in sec_content.split("\n\n"):
-            if para.strip():
-                p = doc.add_paragraph(para.strip())
-                p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        section_text = _coerce_section_content(sec_content)
+        for para in section_text.split("\n\n"):
+            cleaned = para.strip()
+            if not cleaned:
+                continue
+            if cleaned.startswith("## "):
+                doc.add_heading(cleaned[3:].strip(), level=2)
+                continue
+            p = doc.add_paragraph(cleaned)
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
 
     metadata = content.get("metadata", {})
     figures = metadata.get("figures", [])

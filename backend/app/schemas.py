@@ -74,6 +74,7 @@ class ApiLogRead(BaseModel):
 
 
 class ConfigRead(BaseModel):
+    QUALITY_MODE: str
     LLM_PROVIDER: str
     LLM_MODEL: str
     ANTHROPIC_MODEL: str
@@ -84,15 +85,34 @@ class ConfigRead(BaseModel):
     BACKEND_PORT: int
     FRONTEND_PORT: int
     CORS_ORIGINS: List[str]
+    MAX_REVISION_ATTEMPTS: int
+    SECTION_SCORE_TARGET: float
+    COHERENCE_SCORE_TARGET: float
+    MIN_REVISION_DELTA: float
+    MAX_SECTION_REVISION_MINUTES: int
+    MAX_COHERENCE_REVISION_ROUNDS: int
+    REVIEW_MIN_SCORE: float
+    GROUNDING_MIN_SCORE: float
+    COHERENCE_MIN_SCORE: float
 
 
 class ConfigUpdate(BaseModel):
+    QUALITY_MODE: Optional[str] = None
     LLM_PROVIDER: Optional[str] = None
     LLM_MODEL: Optional[str] = None
     ANTHROPIC_MODEL: Optional[str] = None
     LLM_TEMPERATURE: Optional[float] = None
     LLM_MAX_TOKENS: Optional[int] = None
     RESEARCH_SOURCES: Optional[List[str]] = None
+    MAX_REVISION_ATTEMPTS: Optional[int] = None
+    SECTION_SCORE_TARGET: Optional[float] = None
+    COHERENCE_SCORE_TARGET: Optional[float] = None
+    MIN_REVISION_DELTA: Optional[float] = None
+    MAX_SECTION_REVISION_MINUTES: Optional[int] = None
+    MAX_COHERENCE_REVISION_ROUNDS: Optional[int] = None
+    REVIEW_MIN_SCORE: Optional[float] = None
+    GROUNDING_MIN_SCORE: Optional[float] = None
+    COHERENCE_MIN_SCORE: Optional[float] = None
 
 
 class HealthResponse(BaseModel):

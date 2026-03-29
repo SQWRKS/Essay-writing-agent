@@ -1,4 +1,5 @@
 import json
+import time
 import uuid
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,7 +10,28 @@ from app.core.sse import sse_manager
 from app.core.config import settings
 
 
+class PipelinePausedError(RuntimeError):
+    """Raised when a user requests pause while a pipeline is running."""
+
+
 class WorkerPool:
+    def _build_revision_feedback(self, review_result: dict, grounding_result: dict, revision_attempt: int) -> dict:
+        """Build structured revision guidance for the writer."""
+        return {
+            "revision_attempt": revision_attempt,
+            "current_score": float(review_result.get("score", 0.0)),
+            "review_feedback": review_result.get("feedback", ""),
+            "blocking_issues": review_result.get("blocking_issues", [])[:5],
+            "suggestions": review_result.get("suggestions", [])[:6],
+            "weak_categories": [
+                name
+                for name, value in (review_result.get("category_scores", {}) or {}).items()
+                if float(value) < 0.8
+            ],
+            "grounding_issues": grounding_result.get("issues", [])[:5],
+            "unsupported_claim_count": int(grounding_result.get("unsupported_claim_count", 0)),
+        }
+
     def _derive_figure_data(self, sources: list[dict], source_breakdown: dict | None = None) -> dict:
         source_breakdown = source_breakdown or {}
         if not source_breakdown:
@@ -65,6 +87,14 @@ class WorkerPool:
                 "citations": [],
                 "research": {},
                 "figures": [],
+                "quality": {
+                    "sections": {},
+                    "summary": {
+                        "approved_sections": 0,
+                        "flagged_sections": 0,
+                        "average_score": 0.0,
+                    },
+                },
             },
         }
 
@@ -93,6 +123,16 @@ class WorkerPool:
                 "source_breakdown": research_result.get("source_breakdown", {}),
                 "total_found": research_result.get("total_found", 0),
                 "summary": research_result.get("summary", ""),
+                "top_sources": [
+                    {
+                        "title": source.get("title", "Unknown"),
+                        "source": source.get("source", "unknown"),
+                        "year": source.get("year"),
+                        "relevance_score": source.get("relevance_score", 0.0),
+                        "match_reasons": source.get("match_reasons", []),
+                    }
+                    for source in research_result.get("sources", [])[:5]
+                ],
             }
 
             # --- VERIFICATION ---
@@ -104,21 +144,40 @@ class WorkerPool:
             verify_result = await self._run_task(verify_task, db, project_id, verify_input)
             graph.mark_completed(verify_task.id)
             verified_sources = verify_result.get("verified_sources", research_result.get("sources", []))
+            verified_sources = sorted(
+                verified_sources,
+                key=lambda source: float(source.get("combined_quality_score") or source.get("relevance_score") or 0.0),
+                reverse=True,
+            )
             content["metadata"]["sources"] = verified_sources
+            content["metadata"]["research"]["verification_summary"] = verify_result.get("verification_summary", {})
 
             # --- WRITER + REVIEWER per section ---
             sections = plan.get("sections", [])
+            sections = [section for section in sections if section.get("include", True)]
             if not sections:
                 sections = [{"key": "introduction", "title": "Introduction", "word_count_target": 500}]
+            sections_by_key = {item.get("key", "introduction"): item for item in sections}
 
             writer_task_ids = []
+            section_quality_entries = []
             for section_info in sections:
                 sec_key = section_info.get("key", "introduction")
                 section_evidence = self._build_section_evidence(section_info, verified_sources)
+                evidence_count = len(section_evidence)
+                section_word_target = int(section_info.get("word_count_target", 500) or 500)
+                section_max_attempts = int(settings.MAX_REVISION_ATTEMPTS)
+
+                # Results sections can burn tokens when evidence is weak; cap retries and target length.
+                if sec_key == "results" and evidence_count < 3:
+                    section_max_attempts = min(section_max_attempts, 1)
+                    section_word_target = min(section_word_target, 450)
+
                 writer_input = {
                     "section": sec_key,
                     "topic": topic,
-                    "word_count": section_info.get("word_count_target", 500),
+                    "word_count": section_word_target,
+                    "section_plan": section_info,
                     "research_data": {
                         "sources": verified_sources,
                         "section_queries": section_info.get("research_queries", []),
@@ -129,13 +188,37 @@ class WorkerPool:
                 writer_task = await self._create_task(db, project_id, "writer", writer_input, [verify_task.id])
                 graph.add_task(writer_task.id, "writer", [verify_task.id])
                 await db.commit()
+                writer_task_ids.append(writer_task.id)
 
                 write_result = await self._run_task(writer_task, db, project_id, writer_input)
                 graph.mark_completed(writer_task.id)
                 written_content = write_result.get("content", "")
+                revision_attempts_used = 0
+                section_target_score = max(settings.REVIEW_MIN_SCORE, settings.SECTION_SCORE_TARGET)
+                section_started_at = time.monotonic()
+                stop_reason = "initial_review"
+
+                grounding_input = {
+                    "section": sec_key,
+                    "content": written_content,
+                    "evidence_pack": section_evidence,
+                    "revision_attempt": revision_attempts_used,
+                }
+                grounding_task = await self._create_task(db, project_id, "grounding", grounding_input, [writer_task.id])
+                graph.add_task(grounding_task.id, "grounding", [writer_task.id])
+                await db.commit()
+                grounding_result = await self._run_task(grounding_task, db, project_id, grounding_input)
+                graph.mark_completed(grounding_task.id)
 
                 # Reviewer
-                review_input = {"section": sec_key, "content": written_content}
+                review_input = {
+                    "section": sec_key,
+                    "content": written_content,
+                    "expected_word_count": section_info.get("word_count_target", 500),
+                    "evidence_pack": section_evidence,
+                    "grounding_summary": grounding_result,
+                    "revision_attempt": revision_attempts_used,
+                }
                 reviewer_task = await self._create_task(db, project_id, "reviewer", review_input, [writer_task.id])
                 graph.add_task(reviewer_task.id, "reviewer", [writer_task.id])
                 await db.commit()
@@ -143,33 +226,335 @@ class WorkerPool:
                 review_result = await self._run_task(reviewer_task, db, project_id, review_input)
                 graph.mark_completed(reviewer_task.id)
 
-                if not review_result.get("approved", True):
-                    # Revision loop: attempt up to settings.MAX_REVISION_ATTEMPTS revisions
-                    for _attempt in range(settings.MAX_REVISION_ATTEMPTS):
-                        revised_input = {**writer_input, "feedback": review_result.get("feedback", "")}
-                        writer_task2 = await self._create_task(db, project_id, "writer", revised_input, [reviewer_task.id])
-                        graph.add_task(writer_task2.id, "writer", [reviewer_task.id])
-                        await db.commit()
-                        write_result = await self._run_task(writer_task2, db, project_id, revised_input)
-                        graph.mark_completed(writer_task2.id)
-                        written_content = write_result.get("content", written_content)
-                        # Check again after revision
-                        re_review_input = {"section": sec_key, "content": written_content}
-                        re_review_task = await self._create_task(db, project_id, "reviewer", re_review_input, [writer_task2.id])
-                        graph.add_task(re_review_task.id, "reviewer", [writer_task2.id])
-                        await db.commit()
-                        review_result = await self._run_task(re_review_task, db, project_id, re_review_input)
-                        graph.mark_completed(re_review_task.id)
-                        if review_result.get("approved", True):
-                            break
+                current_score = float(review_result.get("score", 0.0))
+                approved = bool(review_result.get("approved", False)) and current_score >= section_target_score
+                if approved:
+                    stop_reason = "target_score_reached"
+                best_snapshot = {
+                    "content": written_content,
+                    "review": review_result,
+                    "grounding": grounding_result,
+                    "score": current_score,
+                    "subheadings": write_result.get("subheadings", []),
+                }
+                plateau_rounds = 0
+                low_grounding_rounds = 1 if float(grounding_result.get("score", 0.0)) < 0.55 else 0
+
+                while not approved:
+                    if revision_attempts_used >= section_max_attempts:
+                        stop_reason = "max_revision_attempts"
+                        break
+
+                    elapsed_minutes = (time.monotonic() - section_started_at) / 60.0
+                    if elapsed_minutes >= settings.MAX_SECTION_REVISION_MINUTES:
+                        stop_reason = "max_revision_minutes"
+                        break
+
+                    revision_attempts_used += 1
+                    structured_feedback = self._build_revision_feedback(review_result, grounding_result, revision_attempts_used)
+                    revised_input = {
+                        **writer_input,
+                        "revision_attempt": revision_attempts_used,
+                        "feedback": json.dumps(structured_feedback),
+                    }
+                    writer_task2 = await self._create_task(db, project_id, "writer", revised_input, [reviewer_task.id])
+                    graph.add_task(writer_task2.id, "writer", [reviewer_task.id])
+                    await db.commit()
+                    writer_task_ids.append(writer_task2.id)
+                    write_result = await self._run_task(writer_task2, db, project_id, revised_input)
+                    graph.mark_completed(writer_task2.id)
+                    revised_content = write_result.get("content", written_content)
+
+                    reground_input = {
+                        "section": sec_key,
+                        "content": revised_content,
+                        "evidence_pack": section_evidence,
+                        "revision_attempt": revision_attempts_used,
+                    }
+                    reground_task = await self._create_task(db, project_id, "grounding", reground_input, [writer_task2.id])
+                    graph.add_task(reground_task.id, "grounding", [writer_task2.id])
+                    await db.commit()
+                    reground_result = await self._run_task(reground_task, db, project_id, reground_input)
+                    graph.mark_completed(reground_task.id)
+
+                    re_review_input = {
+                        "section": sec_key,
+                        "content": revised_content,
+                        "expected_word_count": section_info.get("word_count_target", 500),
+                        "evidence_pack": section_evidence,
+                        "grounding_summary": reground_result,
+                        "revision_attempt": revision_attempts_used,
+                    }
+                    re_review_task = await self._create_task(db, project_id, "reviewer", re_review_input, [writer_task2.id])
+                    graph.add_task(re_review_task.id, "reviewer", [writer_task2.id])
+                    await db.commit()
+                    re_review_result = await self._run_task(re_review_task, db, project_id, re_review_input)
+                    graph.mark_completed(re_review_task.id)
+
+                    new_score = float(re_review_result.get("score", 0.0))
+                    score_delta = new_score - current_score
+
+                    written_content = revised_content
+                    review_result = re_review_result
+                    grounding_result = reground_result
+                    current_score = new_score
+
+                    if new_score > best_snapshot["score"]:
+                        best_snapshot = {
+                            "content": revised_content,
+                            "review": re_review_result,
+                            "grounding": reground_result,
+                            "score": new_score,
+                            "subheadings": write_result.get("subheadings", []),
+                        }
+
+                    if score_delta < settings.MIN_REVISION_DELTA:
+                        plateau_rounds += 1
+                    else:
+                        plateau_rounds = 0
+
+                    if float(reground_result.get("score", 0.0)) < 0.55:
+                        low_grounding_rounds += 1
+                    else:
+                        low_grounding_rounds = 0
+
+                    approved = bool(re_review_result.get("approved", False)) and new_score >= section_target_score
+                    if approved:
+                        stop_reason = "target_score_reached"
+                        break
+                    if plateau_rounds >= 2:
+                        stop_reason = "score_plateau"
+                        break
+                    if low_grounding_rounds >= 2:
+                        stop_reason = "grounding_persistent_low"
+                        break
+
+                if not approved and stop_reason == "initial_review":
+                    stop_reason = "review_not_approved"
+
+                written_content = best_snapshot["content"]
+                review_result = best_snapshot["review"]
+                grounding_result = best_snapshot["grounding"]
 
                 content["sections"][sec_key] = written_content
-                writer_task_ids.append(writer_task.id)
+                content["metadata"].setdefault("subheadings", {})[sec_key] = best_snapshot.get("subheadings", [])
+                section_quality = {
+                    "title": section_info.get("title", sec_key.title()),
+                    "score": review_result.get("score", 0.0),
+                    "approved": bool(review_result.get("approved", False)) and float(review_result.get("score", 0.0)) >= section_target_score,
+                    "target_score": section_target_score,
+                    "stop_reason": stop_reason,
+                    "revision_attempts": revision_attempts_used,
+                    "expected_word_count": section_word_target,
+                    "evidence_count": evidence_count,
+                    "actual_word_count": len(written_content.split()),
+                    "citation_count": review_result.get("citation_count", 0),
+                    "grounding_score": grounding_result.get("score", 0.0),
+                    "grounding_issues": grounding_result.get("issues", []),
+                    "unsupported_claim_count": grounding_result.get("unsupported_claim_count", 0),
+                    "category_scores": review_result.get("category_scores", {}),
+                    "blocking_issues": review_result.get("blocking_issues", []),
+                    "feedback": review_result.get("feedback", ""),
+                    "suggestions": review_result.get("suggestions", []),
+                    "strengths": review_result.get("strengths", []),
+                }
+                content["metadata"]["quality"]["sections"][sec_key] = section_quality
+                section_quality_entries.append(section_quality)
+
+            if section_quality_entries:
+                approved_count = sum(1 for item in section_quality_entries if item.get("approved"))
+                average_score = sum(float(item.get("score", 0.0)) for item in section_quality_entries) / len(section_quality_entries)
+                content["metadata"]["quality"]["summary"] = {
+                    "approved_sections": approved_count,
+                    "flagged_sections": len(section_quality_entries) - approved_count,
+                    "average_score": round(average_score, 3),
+                }
+
+            # --- COHERENCE ---
+            coherence_input = {
+                "topic": topic,
+                "sections": content["sections"],
+                "quality_sections": content["metadata"]["quality"]["sections"],
+            }
+            coherence_task = await self._create_task(db, project_id, "coherence", coherence_input, writer_task_ids)
+            graph.add_task(coherence_task.id, "coherence", writer_task_ids)
+            await db.commit()
+
+            coherence_result = await self._run_task(coherence_task, db, project_id, coherence_input)
+            graph.mark_completed(coherence_task.id)
+
+            coherence_target = max(settings.COHERENCE_MIN_SCORE, settings.COHERENCE_SCORE_TARGET)
+            coherence_round = 0
+            coherence_plateau_rounds = 0
+            coherence_stop_reason = "initial_review"
+            coherence_score = float(coherence_result.get("score", 0.0))
+            coherence_approved = bool(coherence_result.get("approved", False)) and coherence_score >= coherence_target
+            if coherence_approved:
+                coherence_stop_reason = "target_score_reached"
+
+            while not coherence_approved and coherence_round < settings.MAX_COHERENCE_REVISION_ROUNDS:
+                coherence_round += 1
+
+                flagged_keys = []
+                flagged_keys.extend([str(key) for key in coherence_result.get("flagged_sections", [])])
+                flagged_keys.extend([str(key) for key in coherence_result.get("repeated_opening_sections", [])])
+                if not flagged_keys:
+                    weakest = sorted(
+                        content["metadata"]["quality"]["sections"].items(),
+                        key=lambda item: float(item[1].get("score", 0.0)),
+                    )
+                    flagged_keys = [item[0] for item in weakest[:2]]
+
+                deduped_keys = []
+                for key in flagged_keys:
+                    if key in content["sections"] and key not in deduped_keys:
+                        deduped_keys.append(key)
+
+                if not deduped_keys:
+                    coherence_stop_reason = "no_rewritable_sections"
+                    break
+
+                for sec_key in deduped_keys:
+                    section_text = content["sections"].get(sec_key, "")
+                    section_info = sections_by_key.get(sec_key, {"key": sec_key, "title": sec_key.title(), "word_count_target": 500})
+                    section_evidence = self._build_section_evidence(section_info, verified_sources)
+                    section_quality = content["metadata"]["quality"]["sections"].get(sec_key, {})
+
+                    coherence_feedback = {
+                        "coherence_round": coherence_round,
+                        "coherence_score": coherence_score,
+                        "coherence_feedback": coherence_result.get("feedback", ""),
+                        "coherence_issues": coherence_result.get("issues", []),
+                        "coherence_suggestions": coherence_result.get("suggestions", []),
+                        "section_opening": (coherence_result.get("section_summaries", {}).get(sec_key, {}) or {}).get("opening", ""),
+                        "section_blocking_issues": section_quality.get("blocking_issues", []),
+                    }
+                    rewrite_input = {
+                        "section": sec_key,
+                        "topic": topic,
+                        "word_count": section_info.get("word_count_target", 500),
+                        "section_plan": section_info,
+                        "feedback": json.dumps(coherence_feedback),
+                        "research_data": {
+                            "sources": verified_sources,
+                            "section_queries": section_info.get("research_queries", []),
+                            "evidence_pack": section_evidence,
+                            "research_summary": research_result.get("summary", ""),
+                        },
+                    }
+
+                    coherence_writer_task = await self._create_task(db, project_id, "writer", rewrite_input, [coherence_task.id])
+                    graph.add_task(coherence_writer_task.id, "writer", [coherence_task.id])
+                    await db.commit()
+                    writer_task_ids.append(coherence_writer_task.id)
+                    rewrite_result = await self._run_task(coherence_writer_task, db, project_id, rewrite_input)
+                    graph.mark_completed(coherence_writer_task.id)
+                    rewritten_content = rewrite_result.get("content", section_text)
+
+                    reground_input = {
+                        "section": sec_key,
+                        "content": rewritten_content,
+                        "evidence_pack": section_evidence,
+                        "revision_attempt": int(section_quality.get("revision_attempts", 0)) + 1,
+                    }
+                    coherence_grounding_task = await self._create_task(db, project_id, "grounding", reground_input, [coherence_writer_task.id])
+                    graph.add_task(coherence_grounding_task.id, "grounding", [coherence_writer_task.id])
+                    await db.commit()
+                    reground_result = await self._run_task(coherence_grounding_task, db, project_id, reground_input)
+                    graph.mark_completed(coherence_grounding_task.id)
+
+                    re_review_input = {
+                        "section": sec_key,
+                        "content": rewritten_content,
+                        "expected_word_count": section_info.get("word_count_target", 500),
+                        "evidence_pack": section_evidence,
+                        "grounding_summary": reground_result,
+                        "revision_attempt": int(section_quality.get("revision_attempts", 0)) + 1,
+                    }
+                    coherence_reviewer_task = await self._create_task(db, project_id, "reviewer", re_review_input, [coherence_writer_task.id])
+                    graph.add_task(coherence_reviewer_task.id, "reviewer", [coherence_writer_task.id])
+                    await db.commit()
+                    re_review_result = await self._run_task(coherence_reviewer_task, db, project_id, re_review_input)
+                    graph.mark_completed(coherence_reviewer_task.id)
+
+                    content["sections"][sec_key] = rewritten_content
+                    content["metadata"]["quality"]["sections"][sec_key] = {
+                        **section_quality,
+                        "score": re_review_result.get("score", section_quality.get("score", 0.0)),
+                        "approved": bool(re_review_result.get("approved", False)) and float(re_review_result.get("score", 0.0)) >= max(settings.REVIEW_MIN_SCORE, settings.SECTION_SCORE_TARGET),
+                        "revision_attempts": int(section_quality.get("revision_attempts", 0)) + 1,
+                        "target_score": max(settings.REVIEW_MIN_SCORE, settings.SECTION_SCORE_TARGET),
+                        "stop_reason": "coherence_rewrite_round",
+                        "actual_word_count": len(rewritten_content.split()),
+                        "citation_count": re_review_result.get("citation_count", 0),
+                        "grounding_score": reground_result.get("score", 0.0),
+                        "grounding_issues": reground_result.get("issues", []),
+                        "unsupported_claim_count": reground_result.get("unsupported_claim_count", 0),
+                        "category_scores": re_review_result.get("category_scores", {}),
+                        "blocking_issues": re_review_result.get("blocking_issues", []),
+                        "feedback": re_review_result.get("feedback", ""),
+                        "suggestions": re_review_result.get("suggestions", []),
+                        "strengths": re_review_result.get("strengths", []),
+                    }
+
+                updated_sections = content["metadata"]["quality"]["sections"]
+                if updated_sections:
+                    approved_count = sum(1 for item in updated_sections.values() if item.get("approved"))
+                    average_score = sum(float(item.get("score", 0.0)) for item in updated_sections.values()) / len(updated_sections)
+                    content["metadata"]["quality"]["summary"] = {
+                        "approved_sections": approved_count,
+                        "flagged_sections": len(updated_sections) - approved_count,
+                        "average_score": round(average_score, 3),
+                    }
+
+                next_coherence_input = {
+                    "topic": topic,
+                    "sections": content["sections"],
+                    "quality_sections": content["metadata"]["quality"]["sections"],
+                }
+                next_coherence_task = await self._create_task(db, project_id, "coherence", next_coherence_input, writer_task_ids)
+                graph.add_task(next_coherence_task.id, "coherence", writer_task_ids)
+                await db.commit()
+
+                next_coherence_result = await self._run_task(next_coherence_task, db, project_id, next_coherence_input)
+                graph.mark_completed(next_coherence_task.id)
+                new_coherence_score = float(next_coherence_result.get("score", 0.0))
+                score_delta = new_coherence_score - coherence_score
+                coherence_score = new_coherence_score
+                coherence_result = next_coherence_result
+                coherence_task = next_coherence_task
+                coherence_approved = bool(coherence_result.get("approved", False)) and coherence_score >= coherence_target
+
+                if coherence_approved:
+                    coherence_stop_reason = "target_score_reached"
+                    break
+
+                if score_delta < settings.MIN_REVISION_DELTA:
+                    coherence_plateau_rounds += 1
+                else:
+                    coherence_plateau_rounds = 0
+
+                if coherence_plateau_rounds >= 2:
+                    coherence_stop_reason = "score_plateau"
+                    break
+
+            if not coherence_approved and coherence_stop_reason == "initial_review":
+                if coherence_round >= settings.MAX_COHERENCE_REVISION_ROUNDS:
+                    coherence_stop_reason = "max_coherence_rounds"
+                else:
+                    coherence_stop_reason = "coherence_not_approved"
+
+            content["metadata"]["quality"]["coherence"] = coherence_result
+            content["metadata"]["quality"]["summary"]["coherence_score"] = coherence_result.get("score", 0.0)
+            content["metadata"]["quality"]["summary"]["coherence_approved"] = coherence_result.get("approved", False)
+            content["metadata"]["quality"]["summary"]["coherence_target_score"] = coherence_target
+            content["metadata"]["quality"]["summary"]["coherence_revision_rounds"] = coherence_round
+            content["metadata"]["quality"]["summary"]["coherence_stop_reason"] = coherence_stop_reason
 
             # --- CITATION ---
             citation_input = {"sources": verified_sources, "style": "harvard"}
-            citation_task = await self._create_task(db, project_id, "citation", citation_input, writer_task_ids)
-            graph.add_task(citation_task.id, "citation", writer_task_ids)
+            citation_task = await self._create_task(db, project_id, "citation", citation_input, [*writer_task_ids, coherence_task.id])
+            graph.add_task(citation_task.id, "citation", [*writer_task_ids, coherence_task.id])
             await db.commit()
 
             citation_result = await self._run_task(citation_task, db, project_id, citation_input)
@@ -205,6 +590,14 @@ class WorkerPool:
 
             await sse_manager.publish(project_id, "pipeline_complete", {"project_id": project_id, "status": "completed"})
 
+        except PipelinePausedError as e:
+            result = await db.execute(select(Project).where(Project.id == project_id))
+            project = result.scalar_one_or_none()
+            if project:
+                project.status = "paused"
+                project.updated_at = datetime.now(timezone.utc)
+                await db.commit()
+            await sse_manager.publish(project_id, "pipeline_paused", {"project_id": project_id, "reason": str(e)})
         except Exception as e:
             result = await db.execute(select(Project).where(Project.id == project_id))
             project = result.scalar_one_or_none()
@@ -232,8 +625,9 @@ class WorkerPool:
             abstract = (src.get("abstract") or "").lower()
             blob = f"{title} {abstract}"
             overlap = sum(1 for term in terms if term in blob)
-            base = float(src.get("relevance_score") or 0.0)
-            score = base + min(1.0, overlap / 4.0)
+            base = float(src.get("combined_quality_score") or src.get("relevance_score") or 0.0)
+            verification_score = float(src.get("verification_score") or 0.0)
+            score = base + (verification_score * 0.2) + min(1.0, overlap / 4.0)
             scored.append((score, src))
 
         scored.sort(key=lambda item: item[0], reverse=True)
@@ -249,7 +643,9 @@ class WorkerPool:
                     "doi": src.get("doi", ""),
                     "url": src.get("url", ""),
                     "relevance_score": round(score, 3),
+                    "verification_score": round(verification_score, 3),
                     "abstract_excerpt": abstract[:320],
+                    "match_reasons": src.get("match_reasons", []),
                 }
             )
         return evidence
@@ -270,16 +666,37 @@ class WorkerPool:
         return task
 
     async def _run_task(self, task, db, project_id: str, input_data: dict) -> dict:
-        from app.models import Task
+        from app.models import Project, Task
         from app.agents import AGENT_REGISTRY
         from sqlalchemy import select as sel
+
+        project_result = await db.execute(sel(Project).where(Project.id == project_id))
+        project = project_result.scalar_one_or_none()
+        if project is None:
+            raise PipelinePausedError("Project no longer exists")
+        if (project.status or "").lower() == "paused":
+            result_cancel = await db.execute(sel(Task).where(Task.id == task.id))
+            db_task_cancel = result_cancel.scalar_one_or_none()
+            if db_task_cancel and db_task_cancel.status == "pending":
+                db_task_cancel.status = "cancelled"
+                db_task_cancel.error = "Pipeline paused by user"
+                db_task_cancel.completed_at = datetime.now(timezone.utc)
+                await db.commit()
+
+                await sse_manager.publish(project_id, "task_update", {
+                    "task_id": task.id,
+                    "status": "cancelled",
+                    "agent": task.agent_name,
+                    "error": "Pipeline paused by user",
+                })
+            raise PipelinePausedError("Pause requested by user")
 
         result = await db.execute(sel(Task).where(Task.id == task.id))
         db_task = result.scalar_one_or_none()
         if db_task:
             db_task.status = "running"
             db_task.started_at = datetime.now(timezone.utc)
-        await db.flush()
+        await db.commit()
 
         await sse_manager.publish(project_id, "task_update", {
             "task_id": task.id,
@@ -300,7 +717,7 @@ class WorkerPool:
                 db_task2.status = "completed"
                 db_task2.output_data = json.dumps(output)
                 db_task2.completed_at = datetime.now(timezone.utc)
-            await db.flush()
+            await db.commit()
 
             await sse_manager.publish(project_id, "task_update", {
                 "task_id": task.id,
@@ -315,7 +732,7 @@ class WorkerPool:
                 db_task3.status = "failed"
                 db_task3.error = str(e)
                 db_task3.completed_at = datetime.now(timezone.utc)
-            await db.flush()
+            await db.commit()
             await sse_manager.publish(project_id, "task_update", {
                 "task_id": task.id,
                 "status": "failed",

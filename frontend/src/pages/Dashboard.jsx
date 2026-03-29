@@ -1,7 +1,8 @@
 import React, { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { PlusCircle, FolderOpen, AlertCircle, RefreshCw, BookOpen } from 'lucide-react'
+import { PlusCircle, FolderOpen, AlertCircle, RefreshCw, BookOpen, Pause, Trash2 } from 'lucide-react'
 import { useProjects } from '../hooks/useProjects'
+import { useConfig } from '../hooks/useConfig'
 import StatusBadge from '../components/StatusBadge'
 import LoadingSpinner from '../components/LoadingSpinner'
 
@@ -17,12 +18,40 @@ function formatDate(dateStr) {
 }
 
 export default function Dashboard() {
-  const { projects, loading, error, refetch, createProject } = useProjects()
+  const {
+    projects,
+    loading,
+    error,
+    refetch,
+    createProject,
+    pauseProject,
+    deleteProject,
+  } = useProjects()
+  const { config, updateConfig, loading: configLoading } = useConfig()
   const navigate = useNavigate()
 
   const [topic, setTopic] = useState('')
   const [creating, setCreating] = useState(false)
+  const [switchingMode, setSwitchingMode] = useState(false)
   const [createError, setCreateError] = useState(null)
+  const [modeMsg, setModeMsg] = useState(null)
+  const [projectActionMsg, setProjectActionMsg] = useState(null)
+  const [busyProjectId, setBusyProjectId] = useState(null)
+
+  const activeQualityMode = (config?.QUALITY_MODE || 'quality').toLowerCase()
+
+  const handleQualityModeChange = async (mode) => {
+    setSwitchingMode(true)
+    setModeMsg(null)
+    try {
+      await updateConfig({ QUALITY_MODE: mode, LLM_PROVIDER: 'anthropic' })
+      setModeMsg({ type: 'success', text: `Quality mode switched to ${mode}.` })
+    } catch (err) {
+      setModeMsg({ type: 'error', text: err.message || 'Failed to switch quality mode.' })
+    } finally {
+      setSwitchingMode(false)
+    }
+  }
 
   const handleCreate = async (e) => {
     e.preventDefault()
@@ -38,6 +67,35 @@ export default function Dashboard() {
       setCreateError(err.message)
     } finally {
       setCreating(false)
+    }
+  }
+
+  const handlePauseProject = async (projectId) => {
+    setBusyProjectId(projectId)
+    setProjectActionMsg(null)
+    try {
+      await pauseProject(projectId)
+      setProjectActionMsg({ type: 'success', text: 'Project paused.' })
+    } catch (err) {
+      setProjectActionMsg({ type: 'error', text: err.message || 'Could not pause project.' })
+    } finally {
+      setBusyProjectId(null)
+    }
+  }
+
+  const handleDeleteProject = async (projectId, projectTitle) => {
+    const confirmed = window.confirm(`Delete "${projectTitle || 'this project'}"? This cannot be undone.`)
+    if (!confirmed) return
+
+    setBusyProjectId(projectId)
+    setProjectActionMsg(null)
+    try {
+      await deleteProject(projectId)
+      setProjectActionMsg({ type: 'success', text: 'Project deleted.' })
+    } catch (err) {
+      setProjectActionMsg({ type: 'error', text: err.message || 'Could not delete project.' })
+    } finally {
+      setBusyProjectId(null)
     }
   }
 
@@ -57,6 +115,40 @@ export default function Dashboard() {
 
       {/* Create Project */}
       <div className="bg-white rounded-xl border border-gray-200 p-6 shadow-sm">
+        <div className="flex items-start justify-between gap-4 flex-wrap mb-5">
+          <div>
+            <h2 className="text-lg font-semibold text-gray-900">Model Quality Mode</h2>
+            <p className="text-sm text-gray-500 mt-1">
+              {activeQualityMode === 'quality'
+                ? 'Quality mode uses Claude Opus 4.6 for best writing quality.'
+                : 'Balanced mode uses Claude Sonnet 4.6 for faster and lower-cost runs.'}
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => handleQualityModeChange('quality')}
+              disabled={configLoading || switchingMode || activeQualityMode === 'quality'}
+              className="px-3 py-1.5 text-sm rounded-lg border border-gray-200 hover:bg-gray-50 disabled:opacity-50"
+            >
+              Quality
+            </button>
+            <button
+              type="button"
+              onClick={() => handleQualityModeChange('balanced')}
+              disabled={configLoading || switchingMode || activeQualityMode === 'balanced'}
+              className="px-3 py-1.5 text-sm rounded-lg border border-gray-200 hover:bg-gray-50 disabled:opacity-50"
+            >
+              Balanced
+            </button>
+          </div>
+        </div>
+        {modeMsg && (
+          <div className={`mb-4 text-sm rounded-lg px-3 py-2 ${modeMsg.type === 'success' ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}`}>
+            {modeMsg.text}
+          </div>
+        )}
+
         <h2 className="text-lg font-semibold text-gray-900 mb-4">Create New Project</h2>
         <form onSubmit={handleCreate} className="flex gap-3">
           <input
@@ -104,6 +196,12 @@ export default function Dashboard() {
           </button>
         </div>
 
+        {projectActionMsg && (
+          <div className={`mx-6 mt-4 rounded-lg px-3 py-2 text-sm ${projectActionMsg.type === 'success' ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}`}>
+            {projectActionMsg.text}
+          </div>
+        )}
+
         {loading ? (
           <div className="flex justify-center py-16">
             <LoadingSpinner size="lg" />
@@ -143,6 +241,22 @@ export default function Dashboard() {
                 </div>
                 <div className="flex items-center gap-3 ml-4 shrink-0">
                   <StatusBadge status={p.status} />
+                  <button
+                    onClick={() => handlePauseProject(p.id || p._id)}
+                    disabled={busyProjectId === (p.id || p._id) || ['paused', 'completed', 'failed'].includes((p.status || '').toLowerCase())}
+                    className="flex items-center gap-1.5 text-sm font-medium text-amber-700 hover:text-amber-800 bg-amber-50 hover:bg-amber-100 px-3 py-1.5 rounded-lg transition-colors disabled:opacity-40"
+                  >
+                    <Pause size={14} />
+                    Pause
+                  </button>
+                  <button
+                    onClick={() => handleDeleteProject(p.id || p._id, p.title || p.topic)}
+                    disabled={busyProjectId === (p.id || p._id) || (p.status || '').toLowerCase() === 'running'}
+                    className="flex items-center gap-1.5 text-sm font-medium text-red-700 hover:text-red-800 bg-red-50 hover:bg-red-100 px-3 py-1.5 rounded-lg transition-colors disabled:opacity-40"
+                  >
+                    <Trash2 size={14} />
+                    Delete
+                  </button>
                   <button
                     onClick={() => navigate(`/projects/${p.id || p._id}`)}
                     className="flex items-center gap-1.5 text-sm font-medium text-primary-600 hover:text-primary-800 bg-primary-50 hover:bg-primary-100 px-3 py-1.5 rounded-lg transition-colors"

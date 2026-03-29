@@ -47,6 +47,9 @@ SECTION_TEMPLATES = {
 class WriterAgent(AgentBase):
     name = "writer"
 
+    def _format_list(self, items: list[str], bullet: str = "- ") -> str:
+        return "\n".join(f"{bullet}{item}" for item in items if item)
+
     def _first_sentence(self, text: str, max_words: int = 24) -> str:
         if not text:
             return ""
@@ -71,10 +74,32 @@ class WriterAgent(AgentBase):
             year = src.get("year", "n.d.")
             source_name = src.get("source", "unknown")
             abstract = (src.get("abstract") or src.get("abstract_excerpt") or "").strip()
-            if len(abstract) > 220:
-                abstract = abstract[:220].rstrip() + "..."
+            if len(abstract) > 120:
+                abstract = abstract[:120].rstrip() + "..."
             lines.append(f"[{idx}] {title} ({year}, {source_name}) :: {abstract}")
         return "\n".join(lines)
+
+    def _extract_subheadings(self, content: str, limit: int = 2) -> list[dict]:
+        if not content:
+            return []
+        subheadings: list[dict] = []
+        current_title = ""
+        current_lines: list[str] = []
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if line.startswith("## "):
+                if current_title:
+                    subheadings.append({"title": current_title, "content": "\n".join(current_lines).strip()})
+                    if len(subheadings) >= limit:
+                        return subheadings[:limit]
+                current_title = line[3:].strip()
+                current_lines = []
+            elif current_title:
+                current_lines.append(raw_line)
+
+        if current_title and len(subheadings) < limit:
+            subheadings.append({"title": current_title, "content": "\n".join(current_lines).strip()})
+        return subheadings[:limit]
 
     async def execute(self, input_data: dict, project_id: str, db) -> dict:
         await self._update_agent_state(db, project_id, "running")
@@ -82,18 +107,63 @@ class WriterAgent(AgentBase):
         topic = input_data.get("topic", "the topic")
         word_count_target = input_data.get("word_count", 500)
         research_data = input_data.get("research_data", {})
+        section_plan = input_data.get("section_plan", {})
+        feedback = input_data.get("feedback", "")
 
-        if is_llm_available():
-            result = await self._llm_write(section, topic, word_count_target, research_data, project_id, db)
-        else:
-            result = self._template_write(section, topic, word_count_target, research_data)
+        if not is_llm_available():
+            raise RuntimeError(
+                "No LLM provider is configured for WriterAgent. "
+                "Set OPENAI_API_KEY or ANTHROPIC_API_KEY before running the pipeline."
+            )
+
+        result = await self._llm_write(section, topic, word_count_target, research_data, section_plan, feedback, project_id, db)
 
         await self._update_agent_state(db, project_id, "completed", result)
         return result
 
-    def _template_write(self, section: str, topic: str, word_count_target: int, research_data: dict) -> dict:
+    def _template_write(
+        self,
+        section: str,
+        topic: str,
+        word_count_target: int,
+        research_data: dict,
+        section_plan: dict | None = None,
+        feedback: str = "",
+    ) -> dict:
+        section_plan = section_plan or {}
         template = SECTION_TEMPLATES.get(section, SECTION_TEMPLATES["introduction"])
         content_parts = [template.format(topic=topic)]
+
+        thesis_goal = section_plan.get("thesis_goal", "")
+        if thesis_goal:
+            content_parts.append(f"The central claim in this section is that {thesis_goal.strip().rstrip('.')}." )
+
+        must_cover = section_plan.get("must_cover", [])
+        if must_cover:
+            content_parts.append(
+                "The argument develops through "
+                + ", ".join(item.strip() for item in must_cover[:4] if str(item).strip())
+                + "."
+            )
+
+        evidence_requirements = section_plan.get("evidence_requirements", [])
+        if evidence_requirements:
+            content_parts.append(
+                "Evidence in this section is used to substantiate claims about "
+                + ", ".join(item.strip() for item in evidence_requirements[:3] if str(item).strip())
+                + "."
+            )
+
+        writing_directive = section_plan.get("writing_directive", "")
+        if writing_directive:
+            content_parts.append(
+                "The narrative emphasizes a clear argumentative progression from context to evidence and interpretation."
+            )
+
+        if feedback:
+            content_parts.append(
+                "Compared with earlier drafts, this section strengthens specificity, evidence linkage, and analytical depth."
+            )
 
         section_queries = research_data.get("section_queries", [])
         if section_queries:
@@ -158,26 +228,51 @@ class WriterAgent(AgentBase):
 
         return {"section": section, "content": content, "word_count": len(content.split())}
 
-    async def _llm_write(self, section: str, topic: str, word_count_target: int, research_data: dict, project_id: str, db) -> dict:
+    async def _llm_write(
+        self,
+        section: str,
+        topic: str,
+        word_count_target: int,
+        research_data: dict,
+        section_plan: dict | None,
+        feedback: str,
+        project_id: str,
+        db,
+    ) -> dict:
         try:
-            evidence_pack = research_data.get("evidence_pack", [])[:10]
-            section_queries = research_data.get("section_queries", [])[:6]
+            section_plan = section_plan or {}
+            evidence_pack = research_data.get("evidence_pack", [])[:5]
+            section_queries = research_data.get("section_queries", [])[:4]
             research_summary = research_data.get("research_summary", "")
-            sources_summary = self._build_sources_digest(research_data.get("sources", []), limit=10)
+            sources_summary = self._build_sources_digest(research_data.get("sources", []), limit=5)
             evidence_summary = json.dumps(evidence_pack)
+            thesis_goal = section_plan.get("thesis_goal", "")
+            must_cover = section_plan.get("must_cover", [])
+            evidence_requirements = section_plan.get("evidence_requirements", [])
+            writing_directive = section_plan.get("writing_directive", "")
+            subheading_hints = section_plan.get("subheading_hints", [])[:2]
             prompt = (
                 f"You are writing the '{section}' section of an academic essay on '{topic}'.\n"
                 f"Target length: approximately {word_count_target} words.\n"
                 f"Section-specific research queries: {json.dumps(section_queries)}\n\n"
+                f"Section thesis goal: {thesis_goal}\n"
+                f"Must cover:\n{self._format_list(must_cover)}\n\n"
+                f"Evidence requirements:\n{self._format_list(evidence_requirements)}\n\n"
+                f"Writing directive: {writing_directive}\n\n"
+                f"Optional subheading hints (use only if useful): {json.dumps(subheading_hints)}\n\n"
                 f"Research synthesis:\n{research_summary}\n\n"
                 f"High-priority evidence pack (JSON):\n{evidence_summary}\n\n"
                 f"Verified sources digest:\n{sources_summary}\n\n"
+                f"Revision guidance to address:\n{feedback or 'No prior revision feedback.'}\n\n"
                 "Requirements:\n"
                 "1) Produce coherent academic prose with clear logic and transitions.\n"
                 "2) Include concrete, source-grounded claims instead of generic statements.\n"
                 "3) Use inline citation markers like [1], [2] for factual claims, methods, and numbers.\n"
                 "4) Include at least one limitation or uncertainty where appropriate.\n"
                 "5) Do not invent studies or facts outside the provided evidence.\n"
+                "6) Explicitly satisfy the thesis goal and the must-cover requirements for this section.\n"
+                "7) If revision guidance is present, incorporate it directly instead of repeating the earlier draft's weaknesses.\n"
+                "8) You may include at most 2 markdown subheadings using '##' when it improves clarity.\n"
                 "Return only the final section text."
             )
             content = await timed_chat_completion(
@@ -187,6 +282,11 @@ class WriterAgent(AgentBase):
                 log_api_call_fn=self._log_api_call,
                 temperature=0.45,
             )
-            return {"section": section, "content": content, "word_count": len(content.split())}
-        except Exception:
-            return self._template_write(section, topic, word_count_target, research_data)
+            return {
+                "section": section,
+                "content": content,
+                "word_count": len(content.split()),
+                "subheadings": self._extract_subheadings(content),
+            }
+        except Exception as exc:
+            raise RuntimeError(f"WriterAgent failed to generate section '{section}': {exc}") from exc

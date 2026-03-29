@@ -41,7 +41,7 @@ class AgentBase(ABC):
             metadata_json=json.dumps(metadata) if metadata else None,
         )
         db.add(log)
-        await db.flush()
+        await db.commit()
 
     async def _update_agent_state(
         self, db: AsyncSession, project_id: str, status: str, output: dict | None = None
@@ -67,4 +67,4 @@ class AgentBase(ABC):
             state.status = status
             state.last_output = json.dumps(output) if output else None
             state.updated_at = datetime.now(timezone.utc)
-        await db.flush()
+        await db.commit()

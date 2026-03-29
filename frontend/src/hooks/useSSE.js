@@ -3,7 +3,7 @@ import api from '../api/client'
 
 // Derive the SSE base URL from the Axios instance base URL so that all
 // backend connection settings remain in a single place (api/client.js).
-const SSE_BASE_URL = api.defaults.baseURL || 'http://localhost:8000'
+const SSE_BASE_URL = api.defaults.baseURL || ''
 
 export function useSSE(projectId) {
   const [events, setEvents] = useState([])

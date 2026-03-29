@@ -13,11 +13,20 @@ from app.database import get_db
 from app.models import Project, Task, AgentState
 from app.schemas import ProjectCreate, ProjectRead, ProjectUpdate, TaskRead, RunAgentRequest
 from app.orchestration.worker_pool import WorkerPool
+from app.core.sse import sse_manager
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
 BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 EXPORT_DIR = os.path.join(BACKEND_DIR, "exports")
+
+
+async def _load_project_or_404(project_id: str, db: AsyncSession) -> Project:
+    result = await db.execute(select(Project).where(Project.id == project_id))
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
 
 
 @router.post("", response_model=ProjectRead, status_code=201)
@@ -183,12 +192,13 @@ async def export_project(
 
 @router.post("/{project_id}/run", status_code=202)
 async def run_pipeline(project_id: str, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Project).where(Project.id == project_id))
-    project = result.scalar_one_or_none()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project = await _load_project_or_404(project_id, db)
     if project.status == "running":
         raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    project.status = "running"
+    project.updated_at = datetime.now(timezone.utc)
+    await db.commit()
 
     topic = project.topic
 
@@ -200,3 +210,36 @@ async def run_pipeline(project_id: str, background_tasks: BackgroundTasks, db: A
 
     background_tasks.add_task(run_bg)
     return {"message": "Pipeline started", "project_id": project_id}
+
+
+@router.post("/{project_id}/pause", status_code=202)
+async def pause_project(project_id: str, db: AsyncSession = Depends(get_db)):
+    project = await _load_project_or_404(project_id, db)
+
+    if project.status == "completed":
+        raise HTTPException(status_code=409, detail="Completed projects cannot be paused")
+    if project.status == "failed":
+        raise HTTPException(status_code=409, detail="Failed projects cannot be paused")
+    if project.status == "paused":
+        return {"message": "Project already paused", "project_id": project_id}
+
+    project.status = "paused"
+    project.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+
+    await sse_manager.publish(project_id, "pipeline_pause_requested", {"project_id": project_id})
+    return {"message": "Pause requested", "project_id": project_id}
+
+
+@router.delete("/{project_id}")
+async def delete_project(project_id: str, db: AsyncSession = Depends(get_db)):
+    project = await _load_project_or_404(project_id, db)
+
+    if project.status == "running":
+        raise HTTPException(status_code=409, detail="Pause the project before deleting it")
+
+    await db.delete(project)
+    await db.commit()
+
+    await sse_manager.publish(project_id, "project_deleted", {"project_id": project_id})
+    return {"message": "Project deleted", "project_id": project_id}

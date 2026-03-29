@@ -1,8 +1,34 @@
 import json
-import time
+import re
 from app.agents.base import AgentBase
 from app.agents.llm_client import is_llm_available, timed_chat_completion
 from app.core.config import settings
+
+
+TRANSITION_WORDS = {
+    "however", "therefore", "furthermore", "moreover", "consequently",
+    "nevertheless", "although", "while", "thus", "additionally",
+}
+LIMITATION_MARKERS = {
+    "limitation", "limitations", "constraint", "constraints", "uncertain",
+    "uncertainty", "caution", "cautious", "gap", "gaps",
+}
+GENERIC_PHRASES = {
+    "a substantial body of literature exists",
+    "this study employs a rigorous methodological framework",
+    "the analysis of",
+    "this study has provided a comprehensive examination",
+    "researchers have explored multiple dimensions",
+}
+META_WRITING_PATTERNS = {
+    "section objective:",
+    "this section must address",
+    "writing directive:",
+    "revision guidance to address:",
+    "must cover:",
+    "evidence requirements:",
+    "return only the final section text",
+}
 
 
 class ReviewerAgent(AgentBase):
@@ -12,56 +38,228 @@ class ReviewerAgent(AgentBase):
         await self._update_agent_state(db, project_id, "running")
         section = input_data.get("section", "")
         content = input_data.get("content", "")
+        expected_word_count = input_data.get("expected_word_count")
+        evidence_pack = input_data.get("evidence_pack", [])
+        grounding_summary = input_data.get("grounding_summary", {})
+        revision_attempt = int(input_data.get("revision_attempt", 0))
 
         if is_llm_available():
-            result = await self._llm_review(section, content, project_id, db)
+            result = await self._llm_review(
+                section,
+                content,
+                expected_word_count,
+                evidence_pack,
+                grounding_summary,
+                revision_attempt,
+                project_id,
+                db,
+            )
         else:
-            result = self._heuristic_review(section, content)
+            result = self._heuristic_review(section, content, expected_word_count, evidence_pack, grounding_summary, revision_attempt)
 
         await self._update_agent_state(db, project_id, "completed", result)
         return result
 
-    def _heuristic_review(self, section: str, content: str) -> dict:
+    def _extract_citation_markers(self, content: str) -> list[str]:
+        return re.findall(r"\[(\d+)\]", content)
+
+    def _paragraphs(self, content: str) -> list[str]:
+        return [part.strip() for part in content.split("\n\n") if part.strip()]
+
+    def _sentence_count(self, content: str) -> int:
+        return len([chunk for chunk in re.split(r"[.!?]+", content) if chunk.strip()])
+
+    def _repetition_ratio(self, content: str) -> float:
+        words = [word.lower() for word in re.findall(r"\b[a-zA-Z]{4,}\b", content)]
+        if not words:
+            return 1.0
+        return len(set(words)) / len(words)
+
+    def _evidence_keyword_overlap(self, content: str, evidence_pack: list[dict]) -> float:
+        if not evidence_pack:
+            return 1.0
+
+        content_terms = {word.lower() for word in re.findall(r"\b[a-zA-Z]{4,}\b", content)}
+        evidence_terms = set()
+        for evidence in evidence_pack[:6]:
+            title = evidence.get("title", "")
+            evidence_terms.update(word.lower() for word in re.findall(r"\b[a-zA-Z]{4,}\b", title))
+
+        if not evidence_terms:
+            return 0.7
+
+        overlap = len(content_terms & evidence_terms)
+        return min(1.0, overlap / max(3, min(8, len(evidence_terms))))
+
+    def _heuristic_review(
+        self,
+        section: str,
+        content: str,
+        expected_word_count: int | None = None,
+        evidence_pack: list[dict] | None = None,
+        grounding_summary: dict | None = None,
+        revision_attempt: int = 0,
+    ) -> dict:
+        evidence_pack = evidence_pack or []
+        grounding_summary = grounding_summary or {}
         words = content.split()
         word_count = len(words)
-        score = 0.5
         suggestions = []
-        feedback_parts = []
+        strengths = []
+        blocking_issues = []
+        normalized = content.lower()
+        expected_word_count = expected_word_count or 450
+        citation_count = len(self._extract_citation_markers(content))
+        paragraphs = self._paragraphs(content)
+        sentence_count = self._sentence_count(content)
+        repetition_ratio = self._repetition_ratio(content)
+        evidence_overlap = self._evidence_keyword_overlap(content, evidence_pack)
+        meta_markers = [marker for marker in META_WRITING_PATTERNS if marker in normalized]
 
-        if word_count < 100:
-            score -= 0.2
-            suggestions.append("Expand the content significantly.")
-            feedback_parts.append("Content is too short.")
-        elif word_count > 200:
-            score += 0.2
+        coverage_score = min(1.0, word_count / max(120, expected_word_count * 0.9))
+        if word_count < max(120, int(expected_word_count * 0.55)):
+            blocking_issues.append("Section is materially under the requested length.")
+            suggestions.append("Expand the section with more analysis, evidence, and explanation.")
+        elif coverage_score >= 0.9:
+            strengths.append("Section is close to the requested depth and length.")
 
-        if any(word in content.lower() for word in ["however", "therefore", "furthermore", "moreover"]):
-            score += 0.1
-            feedback_parts.append("Good use of transition words.")
+        structure_score = 0.4
+        if len(paragraphs) >= 2:
+            structure_score += 0.25
+        if sentence_count >= 5:
+            structure_score += 0.15
+        if any(word in normalized for word in TRANSITION_WORDS):
+            structure_score += 0.2
+            strengths.append("Section uses connective language to support flow.")
         else:
-            suggestions.append("Add transition words for better flow.")
+            suggestions.append("Add stronger transitions so the argument develops more clearly.")
+        structure_score = min(1.0, structure_score)
 
-        if content.count(".") > 3:
-            score += 0.1
-        if any(c.isdigit() for c in content):
-            score += 0.1
-            feedback_parts.append("Includes numerical data, which is good.")
+        grounding_score = 0.35
+        if evidence_pack:
+            if citation_count >= max(2, min(5, len(evidence_pack))):
+                grounding_score += 0.4
+                strengths.append("Key claims are accompanied by citation markers.")
+            elif citation_count == 0:
+                blocking_issues.append("Evidence was provided but the section does not cite it.")
+                suggestions.append("Add inline citation markers for factual claims and evidence-backed statements.")
+            else:
+                grounding_score += 0.2
 
-        score = min(1.0, max(0.0, score))
-        approved = score >= 0.6
+            grounding_score += 0.25 * evidence_overlap
+            if evidence_overlap < 0.25:
+                suggestions.append("Use more evidence directly from the retrieved sources instead of generic discussion.")
+        else:
+            grounding_score = 0.65
+        grounding_score = min(1.0, grounding_score)
+
+        analysis_score = 0.35
+        if any(word in normalized for word in LIMITATION_MARKERS):
+            analysis_score += 0.25
+            strengths.append("Section acknowledges uncertainty or limitations.")
+        else:
+            suggestions.append("Add at least one limitation, uncertainty, or counterpoint.")
+        if any(token in normalized for token in ["because", "therefore", "suggests", "indicates", "implies"]):
+            analysis_score += 0.25
+        if any(char.isdigit() for char in content):
+            analysis_score += 0.15
+        analysis_score += 0.25 * min(1.0, sentence_count / 8)
+        analysis_score = min(1.0, analysis_score)
+
+        clarity_score = 0.45
+        if repetition_ratio >= 0.45:
+            clarity_score += 0.25
+        else:
+            suggestions.append("Reduce repetitive phrasing and vary sentence construction.")
+        if not any(phrase in normalized for phrase in GENERIC_PHRASES):
+            clarity_score += 0.2
+        else:
+            suggestions.append("Replace generic academic boilerplate with more specific argumentation.")
+        if sentence_count >= 4:
+            clarity_score += 0.1
+        if meta_markers:
+            clarity_score -= 0.35
+            blocking_issues.append("Section contains instructional/meta-writing phrases instead of final argumentative prose.")
+            suggestions.append("Rewrite the section as direct academic prose and remove planning or instruction headers.")
+        clarity_score = min(1.0, clarity_score)
+        clarity_score = max(0.0, clarity_score)
+
+        category_scores = {
+            "coverage": round(coverage_score, 2),
+            "structure": round(structure_score, 2),
+            "grounding": round(grounding_score, 2),
+            "analysis": round(analysis_score, 2),
+            "clarity": round(clarity_score, 2),
+        }
+
+        grounding_validator_score = float(grounding_summary.get("score", category_scores["grounding"]))
+        category_scores["grounding"] = round((category_scores["grounding"] * 0.6) + (grounding_validator_score * 0.4), 2)
+        score = round(sum(category_scores.values()) / len(category_scores), 2)
+
+        if grounding_summary.get("unsupported_claim_count", 0) > 0:
+            blocking_issues.append("Grounding validator found unsupported claim-like sentences.")
+            suggestions.append("Revise unsupported claims so each one is tied to the evidence pack and citations.")
+        for issue in grounding_summary.get("issues", [])[:2]:
+            if issue not in blocking_issues:
+                blocking_issues.append(issue)
+
+        if category_scores["grounding"] < 0.45:
+            blocking_issues.append("Section is not grounded strongly enough in the available evidence.")
+        if category_scores["clarity"] < 0.45:
+            blocking_issues.append("Section is too generic or repetitive to meet the quality bar.")
+        if meta_markers and "Section contains instructional/meta-writing phrases instead of final argumentative prose." not in blocking_issues:
+            blocking_issues.append("Section contains instructional/meta-writing phrases instead of final argumentative prose.")
+
+        approved = score >= settings.REVIEW_MIN_SCORE and not blocking_issues
+        if approved:
+            feedback = "Section meets the current quality gate."
+        else:
+            feedback = "Section needs revision before it meets the current quality gate."
+
         return {
-            "score": round(score, 2),
-            "feedback": " ".join(feedback_parts) if feedback_parts else "Content reviewed.",
-            "suggestions": suggestions,
+            "score": score,
+            "feedback": feedback,
+            "suggestions": suggestions[:6],
+            "strengths": strengths[:5],
+            "blocking_issues": list(dict.fromkeys(blocking_issues))[:5],
+            "category_scores": category_scores,
+            "citation_count": citation_count,
+            "grounding_score": round(grounding_validator_score, 2),
+            "revision_attempt": revision_attempt,
             "approved": approved,
         }
 
-    async def _llm_review(self, section: str, content: str, project_id: str, db) -> dict:
+    async def _llm_review(
+        self,
+        section: str,
+        content: str,
+        expected_word_count: int | None,
+        evidence_pack: list[dict],
+        grounding_summary: dict,
+        revision_attempt: int,
+        project_id: str,
+        db,
+    ) -> dict:
         try:
+            evidence_digest = json.dumps([
+                {
+                    "title": item.get("title"),
+                    "year": item.get("year"),
+                    "source": item.get("source"),
+                    "relevance_score": item.get("relevance_score"),
+                }
+                for item in evidence_pack[:4]
+            ])
             prompt = (
-                f"Review the following '{section}' section of an academic essay. "
-                "Provide a JSON response with: score (0-1 float), feedback (string), suggestions (list of strings), approved (bool).\n\n"
-                f"Content:\n{content[:2000]}"
+                f"Review the following '{section}' section of an academic essay.\n"
+                f"Expected word count: {expected_word_count or 450}.\n"
+                f"Revision attempt: {revision_attempt}.\n"
+                "Evaluate against these categories: coverage, structure, grounding, analysis, clarity.\n"
+                "Return JSON with keys: score (0-1 float), approved (bool), feedback (string), suggestions (array), strengths (array), blocking_issues (array), category_scores (object).\n"
+                "Approval criteria: the section should be rejected if it is generic, weakly grounded, underdeveloped, or missing evidence-backed citations.\n\n"
+                f"Grounding summary:\n{json.dumps(grounding_summary)}\n\n"
+                f"Evidence pack:\n{evidence_digest}\n\n"
+                f"Content:\n{content[:3000]}"
             )
             response_text = await timed_chat_completion(
                 prompt,
@@ -72,6 +270,17 @@ class ReviewerAgent(AgentBase):
                 temperature=0.3,
                 max_tokens=512,
             )
-            return json.loads(response_text)
+            result = json.loads(response_text)
+            result.setdefault("suggestions", [])
+            result.setdefault("strengths", [])
+            result.setdefault("blocking_issues", [])
+            result.setdefault("category_scores", {})
+            result.setdefault("feedback", "Section reviewed.")
+            result["score"] = round(float(result.get("score", 0.0)), 2)
+            result["approved"] = bool(result.get("approved", False)) and result["score"] >= settings.REVIEW_MIN_SCORE
+            result["revision_attempt"] = revision_attempt
+            result["citation_count"] = len(self._extract_citation_markers(content))
+            result["grounding_score"] = round(float(grounding_summary.get("score", 0.0)), 2)
+            return result
         except Exception:
-            return self._heuristic_review(section, content)
+            return self._heuristic_review(section, content, expected_word_count, evidence_pack, grounding_summary, revision_attempt)

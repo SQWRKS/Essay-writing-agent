@@ -5,6 +5,7 @@ Supports OpenAI (default) and Anthropic as LLM providers.
 The provider is selected via the LLM_PROVIDER setting.
 """
 
+import asyncio
 import time
 from typing import Any
 
@@ -23,22 +24,32 @@ async def chat_completion(
 
     Returns the text content of the response.
     Raises RuntimeError if no provider API key is configured.
+    Raises asyncio.TimeoutError (wrapped as RuntimeError) if the request
+    exceeds LLM_REQUEST_TIMEOUT seconds.
     """
     temp = temperature if temperature is not None else settings.LLM_TEMPERATURE
     tokens = max_tokens if max_tokens is not None else settings.LLM_MAX_TOKENS
+    timeout = float(settings.LLM_REQUEST_TIMEOUT)
 
     provider = settings.LLM_PROVIDER.lower()
 
     if provider == "anthropic":
-        return await _anthropic_completion(prompt, temperature=temp, max_tokens=tokens)
+        coro = _anthropic_completion(prompt, temperature=temp, max_tokens=tokens)
+    else:
+        coro = _openai_completion(
+            prompt,
+            temperature=temp,
+            max_tokens=tokens,
+            response_format=response_format,
+        )
 
-    # Default: openai
-    return await _openai_completion(
-        prompt,
-        temperature=temp,
-        max_tokens=tokens,
-        response_format=response_format,
-    )
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        raise RuntimeError(
+            f"LLM API request timed out after {int(timeout)}s "
+            f"(provider={provider}, model={settings.LLM_MODEL if provider != 'anthropic' else settings.ANTHROPIC_MODEL})"
+        ) from None
 
 
 async def _openai_completion(

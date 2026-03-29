@@ -11,6 +11,71 @@ logger = logging.getLogger(__name__)
 class VerificationAgent(AgentBase):
     name = "verification"
 
+    def _score_source(self, source: dict) -> tuple[float, list[str], list[str]]:
+        issues = []
+        strengths = []
+
+        title = (source.get("title") or "").strip()
+        authors = source.get("authors") or []
+        year = source.get("year")
+        doi = (source.get("doi") or "").strip()
+        abstract = (source.get("abstract") or "").strip()
+        venue = (source.get("venue") or "").strip()
+        source_name = source.get("source") or "unknown"
+
+        score = 0.0
+
+        if title:
+            score += 0.18
+            if len(title) > 20:
+                strengths.append("specific title")
+        else:
+            issues.append("missing title")
+
+        if authors:
+            score += 0.14
+            if len(authors) >= 2:
+                strengths.append("multiple named authors")
+        else:
+            issues.append("missing authors")
+
+        if isinstance(year, int) and 1900 <= year <= (time.gmtime().tm_year + 1):
+            score += 0.12
+            if year >= time.gmtime().tm_year - 7:
+                strengths.append("recent publication")
+        else:
+            issues.append("missing or invalid year")
+
+        if doi:
+            if re.match(r"^10\.\d{4,}/", doi):
+                score += 0.2
+                strengths.append("valid DOI")
+            else:
+                issues.append("invalid DOI format")
+        elif source_name in {"semantic_scholar", "web"}:
+            issues.append("missing DOI")
+
+        if abstract:
+            abstract_score = min(0.2, len(abstract) / 1200)
+            score += abstract_score
+            if len(abstract) >= 120:
+                strengths.append("descriptive abstract")
+        else:
+            issues.append("missing abstract")
+
+        if venue:
+            score += 0.05
+            strengths.append("venue metadata available")
+
+        source_bonus = {
+            "semantic_scholar": 0.08,
+            "web": 0.05,
+            "arxiv": 0.03,
+        }.get(source_name, 0.0)
+        score += source_bonus
+
+        return round(min(1.0, score), 3), issues, strengths[:5]
+
     async def execute(self, input_data: dict, project_id: str, db) -> dict:
         await self._update_agent_state(db, project_id, "running")
         sources = input_data.get("sources", [])
@@ -19,38 +84,61 @@ class VerificationAgent(AgentBase):
         rejected = []
 
         for source in sources:
-            issues = []
-            if not source.get("title"):
-                issues.append("missing title")
-            if not source.get("authors"):
-                issues.append("missing authors")
-            if not source.get("year"):
-                issues.append("missing year")
-            doi = source.get("doi", "")
-            if doi and not re.match(r"^10\.\d{4,}/", doi):
-                issues.append("invalid DOI format")
-            if not source.get("abstract"):
-                issues.append("missing abstract")
-
+            score, issues, strengths = self._score_source(source)
             start = time.monotonic()
-            score = 1.0 - (len(issues) * 0.2)
             duration = (time.monotonic() - start) * 1000
-            await self._log_api_call(db, "/verification/check", "POST", self.name, duration, 200, {"issues": issues})
+            await self._log_api_call(
+                db,
+                "/verification/check",
+                "POST",
+                self.name,
+                duration,
+                200,
+                {"issues": issues, "score": score},
+            )
 
-            if score >= 0.6:
-                verified.append({**source, "verification_score": score, "issues": issues})
+            enriched = {
+                **source,
+                "verification_score": score,
+                "issues": issues,
+                "strengths": strengths,
+                "credibility_label": "high" if score >= 0.8 else "medium" if score >= 0.65 else "low",
+            }
+
+            if score >= 0.65:
+                verified.append(enriched)
             else:
-                rejected.append({**source, "verification_score": score, "issues": issues})
+                rejected.append(enriched)
 
         # Use LLM to assess credibility of verified sources when available
         if is_llm_available() and verified:
             verified = await self._llm_assess_credibility(verified, project_id, db)
+
+        verified.sort(
+            key=lambda source: (
+                float(source.get("verification_score", 0.0)),
+                float(source.get("relevance_score", 0.0)),
+            ),
+            reverse=True,
+        )
+
+        for source in verified:
+            source["combined_quality_score"] = round(
+                (float(source.get("relevance_score", 0.0)) * 0.55)
+                + (float(source.get("verification_score", 0.0)) * 0.45),
+                3,
+            )
 
         avg_score = sum(s["verification_score"] for s in verified) / len(verified) if verified else 0.0
         result = {
             "verified_sources": verified,
             "rejected_sources": rejected,
             "verification_score": round(avg_score, 3),
+            "verification_summary": {
+                "verified_count": len(verified),
+                "rejected_count": len(rejected),
+                "high_confidence_count": sum(1 for s in verified if s.get("verification_score", 0.0) >= 0.8),
+            },
         }
         await self._update_agent_state(db, project_id, "completed", result)
         return result
@@ -99,6 +187,9 @@ class VerificationAgent(AgentBase):
                     min(1.0, max(0.0, source["verification_score"] + boost)), 3
                 )
                 source["credibility_notes"] = assessment.get("credibility_notes", "")
+                source["credibility_label"] = (
+                    "high" if source["verification_score"] >= 0.8 else "medium" if source["verification_score"] >= 0.65 else "low"
+                )
         except Exception:
             pass
         return sources

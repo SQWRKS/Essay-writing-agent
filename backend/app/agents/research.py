@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 import httpx
 from app.agents.base import AgentBase
@@ -42,6 +43,19 @@ MOCK_SOURCES = [
 
 class ResearchAgent(AgentBase):
     name = "research"
+
+    def _tokenize(self, text: str) -> set[str]:
+        return {
+            token
+            for token in re.findall(r"\b[a-zA-Z][a-zA-Z0-9\-]{2,}\b", (text or "").lower())
+            if len(token) > 3
+        }
+
+    def _query_terms(self, topic: str, queries: list) -> set[str]:
+        terms = set()
+        for chunk in [topic, *queries]:
+            terms.update(self._tokenize(str(chunk)))
+        return terms
 
     async def execute(self, input_data: dict, project_id: str, db) -> dict:
         await self._update_agent_state(db, project_id, "running")
@@ -99,18 +113,26 @@ class ResearchAgent(AgentBase):
         return result
 
     def _rank_sources(self, sources: list, topic: str, queries: list) -> list:
-        """Assign a lightweight relevance score and sort sources descending."""
+        """Assign a hybrid lexical relevance score and sort sources descending."""
         if not sources:
             return []
 
         current_year = time.gmtime().tm_year
+        query_terms = self._query_terms(topic, queries)
         ranked = []
         for src in sources:
-            title = (src.get("title") or "").lower()
-            abstract = (src.get("abstract") or "").lower()
-            text = f"{title} {abstract}".strip()
+            title = src.get("title") or ""
+            abstract = src.get("abstract") or ""
+            venue = src.get("venue") or ""
 
-            overlap_score = self._source_overlap(text, topic, queries)
+            title_terms = self._tokenize(title)
+            abstract_terms = self._tokenize(abstract)
+            combined_terms = title_terms | abstract_terms
+
+            title_overlap = len(query_terms & title_terms) / max(3, min(8, len(query_terms) or 1))
+            abstract_overlap = len(query_terms & abstract_terms) / max(4, min(12, len(query_terms) or 1))
+            coverage_score = len(query_terms & combined_terms) / max(4, len(query_terms) or 1)
+            exact_phrase_bonus = 0.15 if topic and topic.lower() in f"{title} {abstract}".lower() else 0.0
 
             year = src.get("year") or 0
             recency_score = 0.0
@@ -118,28 +140,57 @@ class ResearchAgent(AgentBase):
                 age = max(0, current_year - year)
                 recency_score = max(0.0, 1.0 - (age / 15.0))
 
-            doi_score = 0.25 if src.get("doi") else 0.0
-            abstract_score = 0.2 if src.get("abstract") else 0.0
-            source_bonus = 0.1 if src.get("source") in {"arxiv", "semantic_scholar", "web"} else 0.0
+            doi_score = 1.0 if src.get("doi") else 0.0
+            abstract_score = min(1.0, len(abstract.strip()) / 250) if abstract else 0.0
+            author_score = min(1.0, len(src.get("authors") or []) / 3)
+            source_bonus = {
+                "semantic_scholar": 1.0,
+                "web": 0.8,
+                "arxiv": 0.75,
+            }.get(src.get("source"), 0.5)
+            venue_bonus = 0.15 if venue else 0.0
 
-            relevance = round((overlap_score * 0.5) + (recency_score * 0.2) + doi_score + abstract_score + source_bonus, 3)
-            ranked.append({**src, "relevance_score": relevance})
+            lexical_score = min(1.0, (title_overlap * 0.45) + (abstract_overlap * 0.35) + (coverage_score * 0.2) + exact_phrase_bonus)
+            relevance = round(
+                (lexical_score * 0.42)
+                + (recency_score * 0.12)
+                + (doi_score * 0.12)
+                + (abstract_score * 0.14)
+                + (author_score * 0.06)
+                + (source_bonus * 0.09)
+                + venue_bonus,
+                3,
+            )
+            ranking_features = {
+                "lexical_score": round(lexical_score, 3),
+                "title_overlap": round(min(1.0, title_overlap), 3),
+                "abstract_overlap": round(min(1.0, abstract_overlap), 3),
+                "coverage_score": round(min(1.0, coverage_score), 3),
+                "recency_score": round(recency_score, 3),
+                "metadata_score": round(((doi_score * 0.5) + (abstract_score * 0.35) + (author_score * 0.15)), 3),
+                "source_bonus": round(source_bonus, 3),
+            }
+            match_reasons = []
+            if exact_phrase_bonus:
+                match_reasons.append("topic phrase appears directly in title or abstract")
+            if title_overlap >= 0.2:
+                match_reasons.append("title overlaps with core query terms")
+            if abstract_overlap >= 0.2:
+                match_reasons.append("abstract covers query-specific concepts")
+            if doi_score:
+                match_reasons.append("source includes DOI metadata")
+
+            ranked.append(
+                {
+                    **src,
+                    "relevance_score": relevance,
+                    "ranking_features": ranking_features,
+                    "match_reasons": match_reasons[:4],
+                }
+            )
 
         ranked.sort(key=lambda item: item.get("relevance_score", 0.0), reverse=True)
         return ranked
-
-    def _source_overlap(self, text: str, topic: str, queries: list) -> float:
-        terms = []
-        for chunk in [topic, *queries]:
-            if not chunk:
-                continue
-            terms.extend([token.lower() for token in chunk.split() if len(token) > 3])
-
-        if not terms or not text:
-            return 0.0
-
-        matches = sum(1 for token in set(terms) if token in text)
-        return min(1.0, matches / max(6, len(set(terms))))
 
     async def _llm_refine_queries(self, queries: list, topic: str, project_id: str, db) -> list:
         """Use LLM to generate focused academic search queries from the input list."""

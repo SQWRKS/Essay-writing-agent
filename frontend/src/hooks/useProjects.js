@@ -1,5 +1,10 @@
 import { useState, useEffect, useCallback } from 'react'
-import { getProjects, createProject as apiCreateProject } from '../api/client'
+import {
+  getProjects,
+  createProject as apiCreateProject,
+  pauseProject as apiPauseProject,
+  deleteProject as apiDeleteProject,
+} from '../api/client'
 
 export function useProjects() {
   const [projects, setProjects] = useState([])
@@ -30,5 +35,26 @@ export function useProjects() {
     return newProject
   }, [])
 
-  return { projects, loading, error, refetch: fetchProjects, createProject }
+  const pauseProject = useCallback(async (projectId) => {
+    await apiPauseProject(projectId)
+    setProjects((prev) => prev.map((project) => {
+      if ((project.id || project._id) !== projectId) return project
+      return { ...project, status: 'paused' }
+    }))
+  }, [])
+
+  const deleteProject = useCallback(async (projectId) => {
+    await apiDeleteProject(projectId)
+    setProjects((prev) => prev.filter((project) => (project.id || project._id) !== projectId))
+  }, [])
+
+  return {
+    projects,
+    loading,
+    error,
+    refetch: fetchProjects,
+    createProject,
+    pauseProject,
+    deleteProject,
+  }
 }
