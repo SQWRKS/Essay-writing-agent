@@ -95,6 +95,42 @@ async def test_writer_agent(db, test_project):
     assert len(result["content"]) > 0
 
 
+def test_writer_template_fallback_is_not_repetitive():
+    from app.agents.writer import WriterAgent
+    agent = WriterAgent()
+
+    result = agent._template_write(
+        section="introduction",
+        topic="sustainable agriculture",
+        word_count_target=220,
+        research_data={
+            "section_queries": ["yield optimization", "soil health", "water efficiency"],
+            "research_summary": "Recent studies converge on integrated soil and irrigation management as a major driver of resilient crop output.",
+            "evidence_pack": [
+                {
+                    "title": "Soil Carbon and Yield Stability",
+                    "year": 2021,
+                    "source": "semantic_scholar",
+                    "abstract_excerpt": "Longitudinal field data show that farms with higher soil carbon had lower inter-annual yield volatility under drought conditions.",
+                },
+                {
+                    "title": "Drip Irrigation Meta-analysis",
+                    "year": 2020,
+                    "source": "web",
+                    "abstract_excerpt": "A meta-analysis across 40 studies reported improved water productivity in drip systems relative to flood irrigation.",
+                },
+            ],
+        },
+    )
+
+    content = result["content"]
+    assert "Evidence highlights:" in content
+    assert "[1]" in content
+    assert "[2]" in content
+    assert content.count("This paper examines sustainable agriculture") <= 1
+    assert result["word_count"] >= 160
+
+
 @pytest.mark.asyncio
 async def test_reviewer_agent(db, test_project):
     from app.agents.reviewer import ReviewerAgent

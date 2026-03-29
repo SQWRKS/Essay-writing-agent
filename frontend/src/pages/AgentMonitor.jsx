@@ -34,6 +34,33 @@ const AGENT_OPTIONS = [
 
 const STATUS_OPTIONS = ['All Statuses', 'pending', 'running', 'completed', 'failed']
 
+function parseTaskPayload(value) {
+  if (!value) return null
+  if (typeof value === 'object') return value
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value)
+    } catch {
+      return { raw: value }
+    }
+  }
+  return { raw: String(value) }
+}
+
+function parseDependencies(value) {
+  if (!value) return []
+  if (Array.isArray(value)) return value
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value)
+      return Array.isArray(parsed) ? parsed : [value]
+    } catch {
+      return value.split(',').map((v) => v.trim()).filter(Boolean)
+    }
+  }
+  return [String(value)]
+}
+
 export default function AgentMonitor() {
   const { id } = useParams()
   const [tasks, setTasks] = useState([])
@@ -158,7 +185,13 @@ export default function AgentMonitor() {
                 {filtered.map((task) => {
                   const key = task.id || task._id || task.task_id
                   const isExpanded = expanded[key]
-                  const hasOutput = task.output || task.result || task.error_message
+                  const parsedOutput =
+                    parseTaskPayload(task.output_data) ||
+                    parseTaskPayload(task.output) ||
+                    parseTaskPayload(task.result)
+                  const outputView = parsedOutput || (task.error ? { error: task.error } : null)
+                  const hasOutput = !!outputView
+                  const deps = parseDependencies(task.dependencies || task.depends_on)
 
                   return (
                     <React.Fragment key={key}>
@@ -192,11 +225,7 @@ export default function AgentMonitor() {
                           {formatDuration(task.started_at, task.completed_at)}
                         </td>
                         <td className="px-4 py-3 text-gray-400 text-xs">
-                          {task.depends_on
-                            ? (Array.isArray(task.depends_on)
-                                ? task.depends_on.join(', ')
-                                : task.depends_on)
-                            : '—'}
+                          {deps.length > 0 ? deps.join(', ') : '—'}
                         </td>
                       </tr>
                       {isExpanded && hasOutput && (
@@ -204,7 +233,7 @@ export default function AgentMonitor() {
                           <td colSpan={8} className="px-6 py-4">
                             <div className="bg-gray-900 rounded-lg p-4 overflow-x-auto">
                               <pre className="text-xs text-green-300 font-mono whitespace-pre-wrap max-h-64 overflow-y-auto">
-                                {JSON.stringify(task.output || task.result || { error: task.error_message }, null, 2)}
+                                {JSON.stringify(outputView, null, 2)}
                               </pre>
                             </div>
                           </td>

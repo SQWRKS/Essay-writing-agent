@@ -49,6 +49,9 @@ class ResearchAgent(AgentBase):
         sources_list = input_data.get("sources", settings.RESEARCH_SOURCES)
         topic = input_data.get("topic", "")
 
+        if not queries and topic:
+            queries = [f"{topic} overview", f"{topic} methods"]
+
         # Use LLM to refine/expand search queries when available
         if is_llm_available() and queries:
             queries = await self._llm_refine_queries(queries, topic, project_id, db)
@@ -57,6 +60,10 @@ class ResearchAgent(AgentBase):
         for source in sources_list:
             if source == "arxiv":
                 srcs = await self._search_arxiv(queries[:2], project_id, db)
+            elif source == "semantic_scholar":
+                srcs = await self._search_semantic_scholar(queries[:3], project_id, db)
+            elif source == "web":
+                srcs = await self._search_crossref(queries[:3], project_id, db)
             else:
                 srcs = self._mock_sources(source, queries)
             all_sources.extend(srcs)
@@ -70,18 +77,69 @@ class ResearchAgent(AgentBase):
                 seen.add(key)
                 unique_sources.append(s)
 
+        ranked_sources = self._rank_sources(unique_sources, topic, queries)
+
+        source_breakdown = {}
+        for src in ranked_sources:
+            src_name = src.get("source", "unknown")
+            source_breakdown[src_name] = source_breakdown.get(src_name, 0) + 1
+
         # Use LLM to synthesize a research summary from gathered sources
         summary = ""
-        if is_llm_available() and unique_sources:
-            summary = await self._llm_summarize(unique_sources, topic, project_id, db)
+        if is_llm_available() and ranked_sources:
+            summary = await self._llm_summarize(ranked_sources, topic, project_id, db)
 
         result = {
-            "sources": unique_sources,
-            "total_found": len(unique_sources),
+            "sources": ranked_sources,
+            "total_found": len(ranked_sources),
+            "source_breakdown": source_breakdown,
             "summary": summary,
         }
         await self._update_agent_state(db, project_id, "completed", result)
         return result
+
+    def _rank_sources(self, sources: list, topic: str, queries: list) -> list:
+        """Assign a lightweight relevance score and sort sources descending."""
+        if not sources:
+            return []
+
+        current_year = time.gmtime().tm_year
+        ranked = []
+        for src in sources:
+            title = (src.get("title") or "").lower()
+            abstract = (src.get("abstract") or "").lower()
+            text = f"{title} {abstract}".strip()
+
+            overlap_score = self._source_overlap(text, topic, queries)
+
+            year = src.get("year") or 0
+            recency_score = 0.0
+            if isinstance(year, int) and year > 1900:
+                age = max(0, current_year - year)
+                recency_score = max(0.0, 1.0 - (age / 15.0))
+
+            doi_score = 0.25 if src.get("doi") else 0.0
+            abstract_score = 0.2 if src.get("abstract") else 0.0
+            source_bonus = 0.1 if src.get("source") in {"arxiv", "semantic_scholar", "web"} else 0.0
+
+            relevance = round((overlap_score * 0.5) + (recency_score * 0.2) + doi_score + abstract_score + source_bonus, 3)
+            ranked.append({**src, "relevance_score": relevance})
+
+        ranked.sort(key=lambda item: item.get("relevance_score", 0.0), reverse=True)
+        return ranked
+
+    def _source_overlap(self, text: str, topic: str, queries: list) -> float:
+        terms = []
+        for chunk in [topic, *queries]:
+            if not chunk:
+                continue
+            terms.extend([token.lower() for token in chunk.split() if len(token) > 3])
+
+        if not terms or not text:
+            return 0.0
+
+        matches = sum(1 for token in set(terms) if token in text)
+        return min(1.0, matches / max(6, len(set(terms))))
 
     async def _llm_refine_queries(self, queries: list, topic: str, project_id: str, db) -> list:
         """Use LLM to generate focused academic search queries from the input list."""
@@ -108,14 +166,25 @@ class ResearchAgent(AgentBase):
         return queries
 
     async def _llm_summarize(self, sources: list, topic: str, project_id: str, db) -> str:
-        """Use LLM to synthesize a brief research summary from gathered sources."""
+        """Use LLM to synthesize a structured research summary from gathered sources."""
         try:
             sources_text = json.dumps(
-                [{"title": s.get("title"), "abstract": s.get("abstract", "")[:200]} for s in sources[:5]]
+                [
+                    {
+                        "title": s.get("title"),
+                        "year": s.get("year"),
+                        "source": s.get("source"),
+                        "abstract": s.get("abstract", "")[:300],
+                    }
+                    for s in sources[:8]
+                ]
             )
             prompt = (
-                f"Based on the following research sources about '{topic}', write a concise 2-3 sentence "
-                "synthesis that highlights key themes, findings, and research gaps.\n\n"
+                f"You are preparing research notes for an academic essay on '{topic}'. "
+                "Using only the provided sources, write a concise but information-dense synthesis in 4-6 sentences. "
+                "Your synthesis must include: (1) key themes, (2) 2-3 concrete findings/trends, "
+                "(3) at least one research gap or unresolved debate. "
+                "Use citation markers like [1], [2] that correspond to source order in the list.\n\n"
                 f"Sources: {sources_text}"
             )
             return await timed_chat_completion(
@@ -123,7 +192,7 @@ class ResearchAgent(AgentBase):
                 db=db,
                 agent_name=self.name,
                 log_api_call_fn=self._log_api_call,
-                max_tokens=256,
+                max_tokens=700,
             )
         except Exception:
             return ""
@@ -146,6 +215,140 @@ class ResearchAgent(AgentBase):
                 duration = (time.monotonic() - start) * 1000
                 await self._log_api_call(db, "https://export.arxiv.org/api/query", "GET", self.name, duration, 500)
                 results.extend(self._mock_sources("arxiv", [query]))
+        return results
+
+    async def _search_semantic_scholar(self, queries: list, project_id: str, db) -> list:
+        results = []
+        for query in queries[:3]:
+            start = time.monotonic()
+            try:
+                async with httpx.AsyncClient(timeout=12.0) as client:
+                    resp = await client.get(
+                        "https://api.semanticscholar.org/graph/v1/paper/search",
+                        params={
+                            "query": query,
+                            "limit": 5,
+                            "fields": "title,abstract,year,url,authors,externalIds,venue",
+                        },
+                    )
+                duration = (time.monotonic() - start) * 1000
+                await self._log_api_call(
+                    db,
+                    "https://api.semanticscholar.org/graph/v1/paper/search",
+                    "GET",
+                    self.name,
+                    duration,
+                    resp.status_code,
+                )
+
+                if resp.status_code == 200:
+                    payload = resp.json() if resp.content else {}
+                    for paper in payload.get("data", []):
+                        authors = [a.get("name") for a in paper.get("authors", []) if a.get("name")]
+                        external_ids = paper.get("externalIds") or {}
+                        doi = external_ids.get("DOI") or ""
+                        results.append(
+                            {
+                                "title": paper.get("title") or "Unknown",
+                                "authors": authors[:5],
+                                "year": paper.get("year") or 2024,
+                                "abstract": (paper.get("abstract") or "")[:800],
+                                "url": paper.get("url") or "",
+                                "doi": doi,
+                                "venue": paper.get("venue") or "",
+                                "source": "semantic_scholar",
+                            }
+                        )
+                else:
+                    results.extend(self._mock_sources("semantic_scholar", [query]))
+            except Exception:
+                duration = (time.monotonic() - start) * 1000
+                await self._log_api_call(
+                    db,
+                    "https://api.semanticscholar.org/graph/v1/paper/search",
+                    "GET",
+                    self.name,
+                    duration,
+                    500,
+                )
+                results.extend(self._mock_sources("semantic_scholar", [query]))
+        return results
+
+    async def _search_crossref(self, queries: list, project_id: str, db) -> list:
+        results = []
+        for query in queries[:3]:
+            start = time.monotonic()
+            try:
+                async with httpx.AsyncClient(timeout=12.0) as client:
+                    resp = await client.get(
+                        "https://api.crossref.org/works",
+                        params={
+                            "query": query,
+                            "rows": 5,
+                            "sort": "relevance",
+                        },
+                        headers={"User-Agent": "EssayWritingAgent/1.0 (research module)"},
+                    )
+                duration = (time.monotonic() - start) * 1000
+                await self._log_api_call(
+                    db,
+                    "https://api.crossref.org/works",
+                    "GET",
+                    self.name,
+                    duration,
+                    resp.status_code,
+                )
+
+                if resp.status_code == 200:
+                    payload = resp.json() if resp.content else {}
+                    items = payload.get("message", {}).get("items", [])
+                    for item in items:
+                        author_items = item.get("author", []) or []
+                        authors = []
+                        for a in author_items:
+                            family = a.get("family") or ""
+                            given = a.get("given") or ""
+                            if family or given:
+                                label = f"{family}, {given}".strip(", ")
+                                authors.append(label)
+
+                        title_list = item.get("title", []) or []
+                        abstract = item.get("abstract") or ""
+                        if abstract:
+                            abstract = abstract.replace("<jats:p>", "").replace("</jats:p>", "")
+
+                        year = 2024
+                        issued = item.get("issued", {}).get("date-parts", [])
+                        if issued and issued[0]:
+                            year = issued[0][0]
+
+                        doi = item.get("DOI") or ""
+                        url = item.get("URL") or (f"https://doi.org/{doi}" if doi else "")
+
+                        results.append(
+                            {
+                                "title": title_list[0] if title_list else "Unknown",
+                                "authors": authors[:5],
+                                "year": year,
+                                "abstract": abstract[:800],
+                                "url": url,
+                                "doi": doi,
+                                "source": "web",
+                            }
+                        )
+                else:
+                    results.extend(self._mock_sources("web", [query]))
+            except Exception:
+                duration = (time.monotonic() - start) * 1000
+                await self._log_api_call(
+                    db,
+                    "https://api.crossref.org/works",
+                    "GET",
+                    self.name,
+                    duration,
+                    500,
+                )
+                results.extend(self._mock_sources("web", [query]))
         return results
 
     def _parse_arxiv(self, xml_text: str) -> list:

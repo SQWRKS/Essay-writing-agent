@@ -5,7 +5,7 @@ from app.models import Project
 
 def export_project_docx(project: Project, output_dir: str) -> str:
     from docx import Document
-    from docx.shared import Pt, Inches
+    from docx.shared import Inches
     from docx.enum.text import WD_ALIGN_PARAGRAPH
 
     content = {}
@@ -34,6 +34,26 @@ def export_project_docx(project: Project, output_dir: str) -> str:
                 p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
 
     metadata = content.get("metadata", {})
+    figures = metadata.get("figures", [])
+    if figures:
+        doc.add_heading("Figures", level=1)
+        for idx, fig in enumerate(figures, 1):
+            title = fig.get("title", f"Figure {idx}")
+            doc.add_paragraph(title)
+
+            fig_path = fig.get("path", "")
+            if fig_path and os.path.exists(fig_path):
+                try:
+                    doc.add_picture(fig_path, width=Inches(6.0))
+                except Exception:
+                    pass
+            elif fig.get("url"):
+                doc.add_paragraph(f"Reference: {fig['url']}")
+
+            description = fig.get("description", "")
+            if description:
+                doc.add_paragraph(description)
+
     bibliography = metadata.get("bibliography", "")
     if bibliography:
         doc.add_heading("Bibliography", level=1)
