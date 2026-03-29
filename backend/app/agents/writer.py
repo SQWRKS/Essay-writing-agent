@@ -1,6 +1,7 @@
 import json
 import time
 from app.agents.base import AgentBase
+from app.agents.llm_client import is_llm_available, timed_chat_completion
 from app.core.config import settings
 
 
@@ -53,7 +54,7 @@ class WriterAgent(AgentBase):
         word_count_target = input_data.get("word_count", 500)
         research_data = input_data.get("research_data", {})
 
-        if settings.OPENAI_API_KEY:
+        if is_llm_available():
             result = await self._llm_write(section, topic, word_count_target, research_data, project_id, db)
         else:
             result = self._template_write(section, topic, word_count_target, research_data)
@@ -77,8 +78,6 @@ class WriterAgent(AgentBase):
 
     async def _llm_write(self, section: str, topic: str, word_count_target: int, research_data: dict, project_id: str, db) -> dict:
         try:
-            from openai import AsyncOpenAI
-            client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
             sources_summary = json.dumps(research_data.get("sources", [])[:3])
             prompt = (
                 f"Write the '{section}' section of an academic essay on '{topic}'. "
@@ -86,16 +85,12 @@ class WriterAgent(AgentBase):
                 f"Available sources: {sources_summary}. "
                 "Write in formal academic style with citations where appropriate."
             )
-            start = time.monotonic()
-            response = await client.chat.completions.create(
-                model=settings.LLM_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=settings.LLM_TEMPERATURE,
-                max_tokens=settings.LLM_MAX_TOKENS,
+            content = await timed_chat_completion(
+                prompt,
+                db=db,
+                agent_name=self.name,
+                log_api_call_fn=self._log_api_call,
             )
-            duration = (time.monotonic() - start) * 1000
-            await self._log_api_call(db, "/openai/chat", "POST", self.name, duration, 200)
-            content = response.choices[0].message.content
             return {"section": section, "content": content, "word_count": len(content.split())}
         except Exception:
             return self._template_write(section, topic, word_count_target, research_data)

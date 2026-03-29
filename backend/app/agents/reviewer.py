@@ -1,6 +1,7 @@
 import json
 import time
 from app.agents.base import AgentBase
+from app.agents.llm_client import is_llm_available, timed_chat_completion
 from app.core.config import settings
 
 
@@ -12,7 +13,7 @@ class ReviewerAgent(AgentBase):
         section = input_data.get("section", "")
         content = input_data.get("content", "")
 
-        if settings.OPENAI_API_KEY:
+        if is_llm_available():
             result = await self._llm_review(section, content, project_id, db)
         else:
             result = self._heuristic_review(section, content)
@@ -57,23 +58,20 @@ class ReviewerAgent(AgentBase):
 
     async def _llm_review(self, section: str, content: str, project_id: str, db) -> dict:
         try:
-            from openai import AsyncOpenAI
-            client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
             prompt = (
                 f"Review the following '{section}' section of an academic essay. "
                 "Provide a JSON response with: score (0-1 float), feedback (string), suggestions (list of strings), approved (bool).\n\n"
                 f"Content:\n{content[:2000]}"
             )
-            start = time.monotonic()
-            response = await client.chat.completions.create(
-                model=settings.LLM_MODEL,
-                messages=[{"role": "user", "content": prompt}],
+            response_text = await timed_chat_completion(
+                prompt,
+                db=db,
+                agent_name=self.name,
+                log_api_call_fn=self._log_api_call,
+                response_format={"type": "json_object"},
                 temperature=0.3,
                 max_tokens=512,
-                response_format={"type": "json_object"},
             )
-            duration = (time.monotonic() - start) * 1000
-            await self._log_api_call(db, "/openai/chat", "POST", self.name, duration, 200)
-            return json.loads(response.choices[0].message.content)
+            return json.loads(response_text)
         except Exception:
             return self._heuristic_review(section, content)
