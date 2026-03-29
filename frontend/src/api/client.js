@@ -51,4 +51,7 @@ export const getConfig = () => api.get('/api/config')
 
 export const updateConfig = (config) => api.post('/api/config', config)
 
+export const updateProjectContent = (projectId, content) =>
+  api.put(`/projects/${projectId}/content`, content)
+
 export default api

@@ -1,4 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import api from '../api/client'
+
+// Derive the SSE base URL from the Axios instance base URL so that all
+// backend connection settings remain in a single place (api/client.js).
+const SSE_BASE_URL = api.defaults.baseURL || 'http://localhost:8000'
 
 export function useSSE(projectId) {
   const [events, setEvents] = useState([])
@@ -13,7 +18,7 @@ export function useSSE(projectId) {
       esRef.current.close()
     }
 
-    const url = `http://localhost:8000/projects/${projectId}/stream`
+    const url = `${SSE_BASE_URL}/projects/${projectId}/stream`
     const es = new EventSource(url)
     esRef.current = es
 

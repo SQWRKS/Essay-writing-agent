@@ -80,6 +80,25 @@ async def get_project(project_id: str, db: AsyncSession = Depends(get_db)):
     }
 
 
+@router.put("/{project_id}/content")
+async def update_project_content(
+    project_id: str,
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Persist manually edited document content back to the database."""
+    result = await db.execute(select(Project).where(Project.id == project_id))
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project.content = json.dumps(payload) if not isinstance(payload, str) else payload
+    project.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(project)
+    return {"id": project.id, "updated_at": project.updated_at}
+
+
 @router.post("/{project_id}/run-agent")
 async def run_agent(project_id: str, payload: RunAgentRequest, db: AsyncSession = Depends(get_db)):
     from app.agents import AGENT_REGISTRY
@@ -137,8 +156,12 @@ async def export_project(
     project = result.scalar_one_or_none()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    if project.status != "completed":
-        raise HTTPException(status_code=400, detail="Project is not yet completed")
+    # Allow export for any non-pending project so users can retrieve partial results
+    if project.status == "pending":
+        raise HTTPException(
+            status_code=400,
+            detail="Project pipeline has not been started yet. Run the pipeline first.",
+        )
 
     os.makedirs(EXPORT_DIR, exist_ok=True)
 

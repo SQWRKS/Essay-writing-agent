@@ -91,14 +91,24 @@ class WorkerPool:
                 graph.mark_completed(reviewer_task.id)
 
                 if not review_result.get("approved", True):
-                    # One revision attempt
-                    revised_input = {**writer_input, "feedback": review_result.get("feedback", "")}
-                    writer_task2 = await self._create_task(db, project_id, "writer", revised_input, [reviewer_task.id])
-                    graph.add_task(writer_task2.id, "writer", [reviewer_task.id])
-                    await db.commit()
-                    write_result = await self._run_task(writer_task2, db, project_id, revised_input)
-                    graph.mark_completed(writer_task2.id)
-                    written_content = write_result.get("content", written_content)
+                    # Revision loop: attempt up to settings.MAX_REVISION_ATTEMPTS revisions
+                    for _attempt in range(settings.MAX_REVISION_ATTEMPTS):
+                        revised_input = {**writer_input, "feedback": review_result.get("feedback", "")}
+                        writer_task2 = await self._create_task(db, project_id, "writer", revised_input, [reviewer_task.id])
+                        graph.add_task(writer_task2.id, "writer", [reviewer_task.id])
+                        await db.commit()
+                        write_result = await self._run_task(writer_task2, db, project_id, revised_input)
+                        graph.mark_completed(writer_task2.id)
+                        written_content = write_result.get("content", written_content)
+                        # Check again after revision
+                        re_review_input = {"section": sec_key, "content": written_content}
+                        re_review_task = await self._create_task(db, project_id, "reviewer", re_review_input, [writer_task2.id])
+                        graph.add_task(re_review_task.id, "reviewer", [writer_task2.id])
+                        await db.commit()
+                        review_result = await self._run_task(re_review_task, db, project_id, re_review_input)
+                        graph.mark_completed(re_review_task.id)
+                        if review_result.get("approved", True):
+                            break
 
                 content["sections"][sec_key] = written_content
                 writer_task_ids.append(writer_task.id)

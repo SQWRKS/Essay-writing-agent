@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { useParams } from 'react-router-dom'
 import { Save, RefreshCw, BookOpen, Quote, AlertCircle, RotateCcw } from 'lucide-react'
-import { getProject, runAgent } from '../api/client'
+import { getProject, runAgent, updateProjectContent } from '../api/client'
 import LoadingSpinner from '../components/LoadingSpinner'
 
 const DEFAULT_SECTIONS = [
@@ -84,11 +84,10 @@ export default function DocumentEditor() {
   const handleSave = async () => {
     setSaving(true)
     setSaveMsg(null)
-    // Store locally since no PUT endpoint is guaranteed
     try {
-      localStorage.setItem(`essay_project_${id}_content`, JSON.stringify(sections))
+      await updateProjectContent(id, sections)
       setDirty(false)
-      setSaveMsg({ type: 'success', text: 'Saved locally.' })
+      setSaveMsg({ type: 'success', text: 'Saved.' })
     } catch (err) {
       setSaveMsg({ type: 'error', text: err.message })
     } finally {
@@ -111,16 +110,8 @@ export default function DocumentEditor() {
     }
   }
 
-  // Load local storage overrides
-  useEffect(() => {
-    const stored = localStorage.getItem(`essay_project_${id}_content`)
-    if (stored) {
-      try {
-        const parsed = JSON.parse(stored)
-        setSections((prev) => ({ ...prev, ...parsed }))
-      } catch { /* ignore */ }
-    }
-  }, [id])
+  // No localStorage fallback needed — content is persisted on the backend via handleSave
+  
 
   const citations = parseCitations(project)
   const activeContent = sections[activeSection] || ''
