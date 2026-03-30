@@ -273,6 +273,20 @@ class WorkerPool:
             content["metadata"]["sources"] = verified_sources
             content["metadata"]["research"]["verification_summary"] = verify_result.get("verification_summary", {})
 
+            # --- THESIS ---
+            thesis_input = {
+                "topic": topic,
+                "research_summaries": research_result.get("summaries", []),
+            }
+            thesis_task = await self._create_task(db, project_id, "thesis", thesis_input, [verify_task.id])
+            graph.add_task(thesis_task.id, "thesis", [verify_task.id])
+            await db.commit()
+
+            thesis_result = await self._run_task(thesis_task, db, project_id, thesis_input)
+            graph.mark_completed(thesis_task.id)
+            thesis_statement = thesis_result.get("thesis", "")
+            content["metadata"]["thesis"] = thesis_statement
+
             # --- WRITER + REVIEWER per section ---
             sections = plan.get("sections", [])
             sections = [section for section in sections if section.get("include", True)]
@@ -301,6 +315,8 @@ class WorkerPool:
                     "section_plan": section_info,
                     "research_data": {
                         "sources": verified_sources,
+                        "summaries": research_result.get("summaries", []),
+                        "thesis": thesis_statement,
                         "section_queries": section_info.get("research_queries", []),
                         "evidence_pack": section_evidence,
                         "research_summary": research_result.get("summary", ""),

@@ -1,5 +1,6 @@
 from app.agents.planner import PlannerAgent
 from app.agents.research import ResearchAgent
+from app.agents.thesis import ThesisAgent
 from app.agents.verification import VerificationAgent
 from app.agents.writer import WriterAgent
 from app.agents.grounding import GroundingAgent

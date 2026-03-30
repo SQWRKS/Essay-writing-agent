@@ -1,5 +1,7 @@
 import json
-import time
+import re
+from collections import Counter
+
 from app.agents.base import AgentBase
 from app.agents.llm_client import is_llm_available, timed_chat_completion, truncate_text, quality_max_tokens
 from app.core.config import settings
@@ -42,6 +44,25 @@ SECTION_TEMPLATES = {
         "for application. Future research should build on these findings to further advance the field."
     ),
 }
+
+PROMPT_LEAK_PATTERNS = [
+    "requirements:",
+    "return only",
+    "you are writing",
+    "target length",
+    "section-specific",
+    "use inline citation markers",
+]
+
+GENERIC_PHRASES = [
+    "this paper examines",
+    "this study explores",
+    "has gained considerable attention",
+    "plays an important role",
+    "in today's world",
+    "it is clear that",
+    "the significance of this research",
+]
 
 
 class WriterAgent(AgentBase):
@@ -177,48 +198,46 @@ class WriterAgent(AgentBase):
                 f"{query_line}."
             )
 
-        research_summary = self._first_sentence(research_data.get("research_summary", ""), max_words=30)
-        if research_summary:
-            content_parts.append(f"Current synthesis across the collected studies suggests {research_summary}")
-
-        evidence_pack = research_data.get("evidence_pack", [])
-        if evidence_pack:
-            evidence_lines = []
-            for idx, ev in enumerate(evidence_pack[:4], 1):
-                title = ev.get("title", "Unknown source")
-                year = ev.get("year", "n.d.")
-                source_name = ev.get("source", "source")
-                abstract_sentence = self._first_sentence(ev.get("abstract_excerpt", "") or ev.get("abstract", ""))
-                if abstract_sentence:
-                    evidence_lines.append(
-                        f"[{idx}] {title} ({year}, {source_name}) reports that {abstract_sentence}"
-                    )
-                else:
-                    evidence_lines.append(f"[{idx}] {title} ({year}, {source_name}) provides directly relevant evidence")
-            content_parts.append("Evidence highlights: " + " ".join(evidence_lines))
-
-        sources = research_data.get("sources", [])
-        if sources and not evidence_pack:
-            source_lines = []
-            for idx, src in enumerate(sources[:4], 1):
-                title = src.get("title", "Unknown source")
-                year = src.get("year", "n.d.")
-                source_lines.append(f"[{idx}] {title} ({year})")
-            content_parts.append("Representative literature includes " + "; ".join(source_lines) + ".")
-
-        content_parts.append(
-            "A key limitation is that source coverage and reported outcomes vary across studies, so causal claims "
-            "should be interpreted with caution and validated against additional datasets where possible."
+        prompt = self.build_prompt(payload, stricter_feedback)
+        return await timed_chat_completion(
+            prompt,
+            db=db,
+            agent_name=self.name,
+            log_api_call_fn=self._log_api_call,
+            temperature=0.25 if attempt == 0 else 0.15,
+            max_tokens=min(1600, max(900, payload["word_count"] * 3)),
         )
 
-        content = "\n\n".join(part.strip() for part in content_parts if part and part.strip())
+    def build_prompt(self, payload: dict, stricter_feedback: str = "") -> str:
+        section_goal = SECTION_GUIDANCE.get(payload["section"], "advance the thesis with technical, evidence-based analysis")
+        return (
+            f"Write the {payload['section']} section of a final-year university paper on '{payload['topic']}'. "
+            f"The section must {section_goal}.\n\n"
+            f"Central thesis:\n{payload['thesis']}\n\n"
+            f"Structured research notes:\n{json.dumps(payload['research_notes'][:8])}\n\n"
+            f"Section queries:\n{json.dumps(payload['section_queries'][:5])}\n\n"
+            f"Literature synthesis:\n{payload['research_summary']}\n\n"
+            f"Revision feedback:\n{payload['feedback']}\n\n"
+            f"Additional constraints:\n{stricter_feedback}\n\n"
+            "Requirements:\n"
+            f"- Write approximately {payload['word_count']} words in polished academic prose.\n"
+            "- Use named studies, systems, datasets, methods, or case examples from the notes.\n"
+            "- Include quantitative evidence whenever the notes provide it.\n"
+            "- Use inline citations like [1], [2], [3] for factual claims.\n"
+            "- Do not mention the prompt, instructions, target length, or that you are an AI.\n"
+            "- Do not use generic filler such as 'this paper examines' or 'has gained considerable attention'.\n"
+            "- Every paragraph must advance the thesis with concrete evidence or technical reasoning.\n"
+            "Return only the final section text."
+        )
 
-        # Expand with non-repetitive connective sentences to approach the requested length.
-        expansion_pool = [
-            f"Taken together, the available evidence indicates that research on {topic} is moving from broad conceptual framing toward more testable and comparative analyses.",
-            "Across the cited studies, consistency appears strongest in core trends, while differences are most visible in study design, sampled populations, and evaluation criteria.",
-            "This section therefore emphasizes convergent findings first, then addresses methodological variance and unresolved questions that limit direct generalization.",
-            "Where numerical or methodological claims are reported, they should be read in context of publication year, data provenance, and domain-specific assumptions.",
+    def _grounded_write(self, payload: dict) -> str:
+        notes = payload["research_notes"][:6]
+        section = payload["section"]
+        topic = payload["topic"]
+        thesis = payload["thesis"] or f"The literature on {topic} supports a specific, evidence-grounded argument."
+
+        paragraphs = [
+            f"{thesis} In the {section} context, the strongest evidence shows that {self._note_sentence(notes[0] if notes else topic, preserve_prefix=True)}",
         ]
         words = content.split()
         idx = 0

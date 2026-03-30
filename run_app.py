@@ -14,9 +14,13 @@ This script:
 import os
 import socket
 import signal
+import shlex
+import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import webbrowser
 import ctypes
 from urllib import error, request
@@ -34,6 +38,8 @@ BACKEND_RELOAD = os.getenv("BACKEND_RELOAD", "0") == "1"
 BROWSER_OPEN_DELAY: int = int(os.getenv("BROWSER_OPEN_DELAY", "3"))
 # Seconds between process health-checks in the main loop
 HEALTH_CHECK_INTERVAL: int = int(os.getenv("HEALTH_CHECK_INTERVAL", "5"))
+# Seconds to wait for backend/frontend to become reachable during startup
+STARTUP_TIMEOUT: int = int(os.getenv("STARTUP_TIMEOUT", "60"))
 # Seconds to wait for a process to exit gracefully before sending SIGKILL
 SHUTDOWN_TIMEOUT: int = int(os.getenv("SHUTDOWN_TIMEOUT", "15"))
 
@@ -225,7 +231,8 @@ def run() -> None:
     except Exception:
         print(f"[run_app] Could not open browser automatically. Visit {frontend_url}")
 
-    print("[run_app] System running. Press Ctrl+C to stop.")
+    print("[run_app] System running. Keep this terminal open while using the app.")
+    print("[run_app] Press Ctrl+C only when you want to stop both backend and frontend.")
     try:
         while True:
             # Shut down cleanly if either process dies unexpectedly

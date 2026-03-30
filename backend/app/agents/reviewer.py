@@ -33,6 +33,7 @@ META_WRITING_PATTERNS = {
 
 class ReviewerAgent(AgentBase):
     name = "reviewer"
+    approval_threshold = 0.72
 
     async def execute(self, input_data: dict, project_id: str, db) -> dict:
         await self._update_agent_state(db, project_id, "running")
@@ -44,6 +45,7 @@ class ReviewerAgent(AgentBase):
         revision_attempt = int(input_data.get("revision_attempt", 0))
         rubric: str = (input_data.get("rubric") or "").strip()
 
+        heuristic = self._heuristic_review(section, content, thesis, research_notes)
         if is_llm_available():
             result = await self._llm_review(
                 section,
@@ -233,6 +235,13 @@ class ReviewerAgent(AgentBase):
             "grounding_score": round(grounding_validator_score, 2),
             "revision_attempt": revision_attempt,
             "approved": approved,
+            "metrics": {
+                "repeated_phrase_ratio": round(repeated_ratio, 3),
+                "citation_count": citation_count,
+                "generic_phrase_count": len(generic_hits),
+                "quantitative_signal_count": digit_count,
+                "domain_keyword_hits": len(domain_hits),
+            },
         }
 
     async def _llm_review(
@@ -279,8 +288,8 @@ class ReviewerAgent(AgentBase):
                 agent_name=self.name,
                 log_api_call_fn=self._log_api_call,
                 response_format={"type": "json_object"},
-                temperature=0.3,
-                max_tokens=512,
+                temperature=0.15,
+                max_tokens=700,
             )
             result = json.loads(response_text)
             result.setdefault("suggestions", [])

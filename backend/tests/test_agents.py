@@ -60,10 +60,12 @@ async def test_research_agent(db, test_project):
     from app.agents.research import ResearchAgent
     agent = ResearchAgent()
     result = await agent.execute(
-        {"queries": ["machine learning overview"], "sources": ["web"]},
+        {"topic": "machine learning", "queries": ["machine learning overview"], "sources": ["web"]},
         test_project.id, db
     )
     assert "sources" in result
+    assert "summaries" in result
+    assert "queries" in result
     assert "total_found" in result
     assert isinstance(result["sources"], list)
     if result["sources"]:
@@ -134,14 +136,28 @@ async def test_writer_agent(db, test_project, monkeypatch):
 
     agent = WriterAgent()
     result = await agent.execute(
-        {"section": "introduction", "topic": "machine learning", "word_count": 200, "research_data": {}},
+        {
+            "section": "introduction",
+            "topic": "machine learning",
+            "word_count": 200,
+            "thesis": "Machine learning systems deliver the best engineering outcomes when model complexity is matched to data quality and deployment constraints.",
+            "research_notes": [
+                "[1] Benchmark Compression Study: Quantization reduced model size by 75% while preserving more than 98% of baseline accuracy on embedded vision workloads.",
+                "[2] Edge Inference Evaluation: Latency fell below 20 ms once pruning and operator fusion were combined for ARM-class devices.",
+                "[3] Energy Profiling Survey: Energy draw scaled non-linearly with parameter count, especially under sustained inference loads.",
+            ],
+            "research_data": {"section_queries": ["model compression", "edge inference latency"]},
+        },
         test_project.id, db
     )
     assert "section" in result
     assert "content" in result
     assert "word_count" in result
+    assert "validation" in result
     assert result["section"] == "introduction"
     assert len(result["content"]) > 0
+    assert result["validation"]["citation_count"] >= 1
+    assert "this paper examines" not in result["content"].lower()
 
 
 @pytest.mark.asyncio
@@ -269,19 +285,21 @@ def test_writer_template_fallback_is_not_repetitive():
             "research_summary": "Recent studies converge on integrated soil and irrigation management as a major driver of resilient crop output.",
             "evidence_pack": [
                 {
-                    "title": "Soil Carbon and Yield Stability",
-                    "year": 2021,
-                    "source": "semantic_scholar",
-                    "abstract_excerpt": "Longitudinal field data show that farms with higher soil carbon had lower inter-annual yield volatility under drought conditions.",
+                    "source": {"title": "Liquid Cooling Study"},
+                    "key_findings": "Liquid cooling maintained cell temperature below 35 C during high-rate discharge.",
+                    "quantitative_data": ["35 C"],
+                    "relevance_score": 0.91,
                 },
                 {
-                    "title": "Drip Irrigation Meta-analysis",
-                    "year": 2020,
-                    "source": "web",
-                    "abstract_excerpt": "A meta-analysis across 40 studies reported improved water productivity in drip systems relative to flood irrigation.",
+                    "source": {"title": "Phase Change Material Review"},
+                    "key_findings": "Phase change materials reduced peak temperature spikes but introduced mass and packaging penalties.",
+                    "quantitative_data": ["12% mass increase"],
+                    "relevance_score": 0.82,
                 },
             ],
         },
+        test_project.id,
+        db,
     )
 
     content = result["content"]
@@ -418,9 +436,17 @@ def test_reviewer_heuristic_rewards_grounded_specific_content():
 async def test_reviewer_agent(db, test_project):
     from app.agents.reviewer import ReviewerAgent
     agent = ReviewerAgent()
-    content = "This is a test section about machine learning. " * 20
+    content = "This paper examines machine learning. This paper examines machine learning. It is important to note that machine learning matters."
     result = await agent.execute(
-        {"section": "introduction", "content": content},
+        {
+            "section": "introduction",
+            "content": content,
+            "thesis": "Machine learning deployment quality depends on evidence-based trade-offs between model accuracy, latency, and energy use.",
+            "research_notes": [
+                "[1] Embedded inference benchmarks reported 18 ms latency on ARM hardware after pruning.",
+                "[2] Energy profiling showed a 22% increase in draw for oversized transformer variants.",
+            ],
+        },
         test_project.id, db
     )
     assert "score" in result

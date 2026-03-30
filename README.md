@@ -45,7 +45,13 @@ cd frontend && npm install && cd ..
 python run_app.py
 ```
 
-The browser opens automatically at http://localhost:3000.
+`run_app.py` waits for both services to become reachable before opening the browser.
+If a healthy backend or frontend is already running on the configured port, it reuses that service instead of failing on an address-in-use error.
+
+Keep the terminal open while using the app. Press `Ctrl+C` only when you want to stop the services started by the launcher.
+
+Frontend: http://localhost:3000  
+Backend API health: http://localhost:8000/api/health
 
 ### Option 2 — Docker Compose
 
@@ -129,6 +135,10 @@ essay-writing-agent/
 | `FRONTEND_PORT` | `3000` | Frontend dev-server port |
 | `CORS_ORIGINS` | `http://localhost:3000,…` | Allowed CORS origins |
 | `LOG_LEVEL` | `INFO` | Python logging level |
+| `BROWSER_OPEN_DELAY` | `3` | Delay before opening the browser after both services are ready |
+| `STARTUP_TIMEOUT` | `60` | Max time to wait for backend and frontend readiness |
+| `HEALTH_CHECK_INTERVAL` | `5` | Interval for launcher process health checks |
+| `SHUTDOWN_TIMEOUT` | `15` | Time to wait for graceful shutdown before force-killing child processes |
 
 ---
 
