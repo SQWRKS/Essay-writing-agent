@@ -570,6 +570,9 @@ class WorkerPool:
                             "research_summary": research_result.get("summary", ""),
                         },
                     }
+                    # Propagate writing_style through coherence rewrites (no-op when empty)
+                    if ft_writing_style:
+                        rewrite_input["writing_style"] = ft_writing_style
 
                     coherence_writer_task = await self._create_task(db, project_id, "writer", rewrite_input, [coherence_task.id])
                     graph.add_task(coherence_writer_task.id, "writer", [coherence_task.id])

@@ -87,11 +87,15 @@ export default function Dashboard() {
       )
 
       // Upload context file if one was selected (non-blocking — errors are surfaced but don't abort)
+      let fileUploadFailed = false
       if (contextFile) {
         try {
           await uploadContextFile(project.id || project._id, contextFile)
         } catch (fileErr) {
+          // Keep the user on the dashboard so the error is visible.
+          // The project was created; they can open it from the list below.
           setCreateError(`Project created but file upload failed: ${fileErr.message}`)
+          fileUploadFailed = true
         }
       }
 
@@ -105,7 +109,11 @@ export default function Dashboard() {
       setRubric('')
       setShowFineTune(false)
 
-      navigate(`/projects/${project.id || project._id}`)
+      // Only navigate on full success — if the file upload failed we stay on
+      // the dashboard so the user can read the error and open the project manually.
+      if (!fileUploadFailed) {
+        navigate(`/projects/${project.id || project._id}`)
+      }
     } catch (err) {
       setCreateError(err.message)
     } finally {

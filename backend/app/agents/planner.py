@@ -185,6 +185,11 @@ class PlannerAgent(AgentBase):
             scale = word_count_target / default_total
             for section in sections:
                 section["word_count_target"] = max(80, int(section["word_count_target"] * scale))
+            # Recalculate after scaling so estimated_total_words reflects the
+            # actual post-scaling targets, not the pre-scaling LLM estimate.
+            estimated_total = sum(s["word_count_target"] for s in sections)
+        else:
+            estimated_total = int(plan.get("estimated_total_words") or sum(s["word_count_target"] for s in sections))
 
         research_queries = plan.get("research_queries") or []
         if not isinstance(research_queries, list):
@@ -197,7 +202,7 @@ class PlannerAgent(AgentBase):
         return {
             "sections": sections,
             "research_queries": list(dict.fromkeys(research_queries)),
-            "estimated_total_words": int(plan.get("estimated_total_words") or sum(s["word_count_target"] for s in sections)),
+            "estimated_total_words": estimated_total,
         }
 
     async def execute(self, input_data: dict, project_id: str, db) -> dict:

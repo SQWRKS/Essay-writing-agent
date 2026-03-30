@@ -37,8 +37,10 @@ export const createProject = (title, topic, settings) =>
 export const uploadContextFile = (projectId, file) => {
   const formData = new FormData()
   formData.append('file', file)
+  // Do NOT set Content-Type manually — axios auto-sets it to
+  // 'multipart/form-data; boundary=<...>' when the body is FormData.
+  // Manually overriding it strips the boundary and breaks the upload.
   return api.post(`/projects/${projectId}/upload-context`, formData, {
-    headers: { 'Content-Type': 'multipart/form-data' },
     timeout: 60000,
   })
 }
