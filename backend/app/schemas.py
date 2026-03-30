@@ -3,9 +3,42 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 
 
+class ProjectSettings(BaseModel):
+    """Fine-tune settings for project generation.  Every field is optional.
+
+    If a field is omitted the pipeline uses its built-in default, so the
+    system behaves identically to before when no settings are provided.
+    """
+
+    word_count_target: Optional[int] = Field(
+        None,
+        ge=100,
+        le=50000,
+        description="Target total word count for the essay.  Section targets "
+                    "are scaled proportionally when this is set.",
+    )
+    writing_style: Optional[str] = Field(
+        None,
+        description="Writing style / tone hint passed to the writer agent "
+                    "(e.g. 'academic', 'argumentative', 'persuasive', 'analytical').",
+    )
+    context_text: Optional[str] = Field(
+        None,
+        description="Additional background context or domain knowledge "
+                    "supplied by the user.  Prepended to the topic for the "
+                    "planner and research queries.",
+    )
+    rubric: Optional[str] = Field(
+        None,
+        description="Marking rubric or grading criteria.  The reviewer agent "
+                    "uses these criteria when evaluating each section.",
+    )
+
+
 class ProjectCreate(BaseModel):
     title: str
     topic: str
+    settings: Optional[ProjectSettings] = None
 
 
 class ProjectUpdate(BaseModel):
@@ -23,6 +56,7 @@ class ProjectRead(BaseModel):
     created_at: datetime
     updated_at: datetime
     content: Optional[str] = None
+    settings_json: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
@@ -74,25 +108,47 @@ class ApiLogRead(BaseModel):
 
 
 class ConfigRead(BaseModel):
+    QUALITY_MODE: str
     LLM_PROVIDER: str
     LLM_MODEL: str
     ANTHROPIC_MODEL: str
     LLM_TEMPERATURE: float
     LLM_MAX_TOKENS: int
     RESEARCH_SOURCES: List[str]
+    WEB_SEARCH_ENABLED: bool
     LOG_LEVEL: str
     BACKEND_PORT: int
     FRONTEND_PORT: int
     CORS_ORIGINS: List[str]
+    MAX_REVISION_ATTEMPTS: int
+    SECTION_SCORE_TARGET: float
+    COHERENCE_SCORE_TARGET: float
+    MIN_REVISION_DELTA: float
+    MAX_SECTION_REVISION_MINUTES: int
+    MAX_COHERENCE_REVISION_ROUNDS: int
+    REVIEW_MIN_SCORE: float
+    GROUNDING_MIN_SCORE: float
+    COHERENCE_MIN_SCORE: float
 
 
 class ConfigUpdate(BaseModel):
+    QUALITY_MODE: Optional[str] = None
     LLM_PROVIDER: Optional[str] = None
     LLM_MODEL: Optional[str] = None
     ANTHROPIC_MODEL: Optional[str] = None
     LLM_TEMPERATURE: Optional[float] = None
     LLM_MAX_TOKENS: Optional[int] = None
     RESEARCH_SOURCES: Optional[List[str]] = None
+    WEB_SEARCH_ENABLED: Optional[bool] = None
+    MAX_REVISION_ATTEMPTS: Optional[int] = None
+    SECTION_SCORE_TARGET: Optional[float] = None
+    COHERENCE_SCORE_TARGET: Optional[float] = None
+    MIN_REVISION_DELTA: Optional[float] = None
+    MAX_SECTION_REVISION_MINUTES: Optional[int] = None
+    MAX_COHERENCE_REVISION_ROUNDS: Optional[int] = None
+    REVIEW_MIN_SCORE: Optional[float] = None
+    GROUNDING_MIN_SCORE: Optional[float] = None
+    COHERENCE_MIN_SCORE: Optional[float] = None
 
 
 class HealthResponse(BaseModel):

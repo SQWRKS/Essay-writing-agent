@@ -3,6 +3,14 @@ import os
 from app.models import Project
 
 
+def _coerce_section_content(section_payload):
+    if isinstance(section_payload, dict):
+        return str(section_payload.get("content") or "")
+    if isinstance(section_payload, str):
+        return section_payload
+    return str(section_payload or "")
+
+
 def export_project_txt(project: Project, output_dir: str) -> str:
     content = {}
     if project.content:
@@ -24,7 +32,7 @@ def export_project_txt(project: Project, output_dir: str) -> str:
     for sec_key, sec_content in sections.items():
         lines.append(sec_key.replace("_", " ").title())
         lines.append("-" * 40)
-        lines.append(sec_content)
+        lines.append(_coerce_section_content(sec_content))
         lines.append("")
 
     metadata = content.get("metadata", {})

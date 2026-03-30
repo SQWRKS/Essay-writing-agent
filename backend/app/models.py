@@ -19,6 +19,8 @@ class Project(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # JSON-encoded ProjectSettings: all fields optional (word_count_target, rubric, writing_style, context_text)
+    settings_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     tasks: Mapped[list["Task"]] = relationship("Task", back_populates="project", cascade="all, delete-orphan")
     agent_states: Mapped[list["AgentState"]] = relationship("AgentState", back_populates="project", cascade="all, delete-orphan")

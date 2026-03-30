@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams } from 'react-router-dom'
 import { ChevronDown, ChevronRight, Filter, RefreshCw, AlertCircle } from 'lucide-react'
 import { getTasks } from '../api/client'
@@ -23,13 +23,15 @@ function formatDuration(start, end) {
 
 const AGENT_OPTIONS = [
   'All Agents',
-  'ResearchAgent',
-  'OutlineAgent',
-  'WriterAgent',
-  'CitationAgent',
-  'ReviewAgent',
-  'FormatterAgent',
-  'QualityAgent',
+  'planner',
+  'research',
+  'verification',
+  'writer',
+  'grounding',
+  'reviewer',
+  'coherence',
+  'citation',
+  'figure',
 ]
 
 const STATUS_OPTIONS = ['All Statuses', 'pending', 'running', 'completed', 'failed']
@@ -61,10 +63,47 @@ function parseDependencies(value) {
   return [String(value)]
 }
 
+function summarizeTaskOutput(outputView) {
+  if (!outputView || typeof outputView !== 'object') return 'No structured output'
+
+  if (typeof outputView.score === 'number') {
+    const approval = outputView.approved === true ? 'approved' : outputView.approved === false ? 'flagged' : 'scored'
+    return `Score ${outputView.score} · ${approval}`
+  }
+
+  if (typeof outputView.total_found === 'number') {
+    return `${outputView.total_found} sources found`
+  }
+
+  if (typeof outputView.verification_score === 'number') {
+    return `Verification ${outputView.verification_score}`
+  }
+
+  if (typeof outputView.claim_count === 'number') {
+    return `${outputView.supported_claim_count || 0}/${outputView.claim_count} grounded claims`
+  }
+
+  if (typeof outputView.estimated_total_words === 'number') {
+    return `${outputView.sections?.length || 0} planned sections`
+  }
+
+  if (Array.isArray(outputView.formatted_citations)) {
+    return `${outputView.formatted_citations.length} citations generated`
+  }
+
+  if (Array.isArray(outputView.figures)) {
+    return `${outputView.figures.length} figures generated`
+  }
+
+  return 'Structured output available'
+}
+
 export default function AgentMonitor() {
   const { id } = useParams()
+  const hasLoadedTasksRef = useRef(false)
   const [tasks, setTasks] = useState([])
   const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState(null)
   const [expanded, setExpanded] = useState({})
   const [agentFilter, setAgentFilter] = useState('All Agents')
@@ -72,25 +111,46 @@ export default function AgentMonitor() {
 
   const { events, connected } = useSSE(id)
 
-  const fetchTasks = useCallback(async () => {
-    setLoading(true)
-    setError(null)
+  const fetchTasks = useCallback(async ({ background = false, silentError = false } = {}) => {
+    if (background) {
+      setRefreshing(true)
+    } else {
+      setLoading(true)
+      setError(null)
+    }
+
     try {
       const res = await getTasks(id)
       const raw = res.data
       setTasks(Array.isArray(raw) ? raw : (raw?.tasks ?? []))
+      hasLoadedTasksRef.current = true
     } catch (err) {
-      setError(err.message)
+      if (!silentError && (!background || !hasLoadedTasksRef.current)) {
+        setError(err.message)
+      }
     } finally {
       setLoading(false)
+      setRefreshing(false)
     }
   }, [id])
 
   useEffect(() => { fetchTasks() }, [fetchTasks])
 
   useEffect(() => {
-    if (events.length > 0) fetchTasks()
+    if (events.length > 0) {
+      fetchTasks({ background: true, silentError: true })
+    }
   }, [events, fetchTasks])
+
+  // Fallback polling every 10s while any task is running (in case SSE is missed)
+  useEffect(() => {
+    const hasRunning = tasks.some((t) => (t.status || '').toLowerCase() === 'running')
+    if (!hasRunning || connected) return
+    const timer = setInterval(() => {
+      fetchTasks({ background: true, silentError: true })
+    }, 30000)
+    return () => clearInterval(timer)
+  }, [tasks, connected, fetchTasks])
 
   const toggleExpand = (taskId) =>
     setExpanded((prev) => ({ ...prev, [taskId]: !prev[taskId] }))
@@ -105,7 +165,7 @@ export default function AgentMonitor() {
     return agentMatch && statusMatch
   })
 
-  if (loading) return <div className="flex justify-center py-20"><LoadingSpinner size="lg" /></div>
+  if (loading && tasks.length === 0) return <div className="flex justify-center py-20"><LoadingSpinner size="lg" /></div>
   if (error) return (
     <div className="max-w-xl mx-auto mt-12 bg-red-50 border border-red-200 rounded-xl p-6 text-center">
       <AlertCircle className="mx-auto mb-2 text-red-500" size={32} />
@@ -125,10 +185,11 @@ export default function AgentMonitor() {
             <span className={connected ? 'text-green-600' : 'text-gray-400'}>
               {connected ? '● Live' : '○ Disconnected'}
             </span>
+            {refreshing && <span className="ml-2 text-gray-400">Updating…</span>}
           </p>
         </div>
         <button
-          onClick={fetchTasks}
+          onClick={() => fetchTasks({ background: true })}
           className="flex items-center gap-1.5 px-3 py-2 text-sm text-gray-600 hover:text-gray-900 border border-gray-200 rounded-lg hover:bg-gray-50"
         >
           <RefreshCw size={14} />
@@ -175,6 +236,7 @@ export default function AgentMonitor() {
                   <th className="px-4 py-3">Task Name</th>
                   <th className="px-4 py-3">Agent</th>
                   <th className="px-4 py-3">Status</th>
+                  <th className="px-4 py-3">Summary</th>
                   <th className="px-4 py-3">Started</th>
                   <th className="px-4 py-3">Completed</th>
                   <th className="px-4 py-3">Duration</th>
@@ -215,6 +277,9 @@ export default function AgentMonitor() {
                         <td className="px-4 py-3">
                           <StatusBadge status={task.status} />
                         </td>
+                        <td className="px-4 py-3 text-xs text-gray-500 max-w-xs">
+                          {hasOutput ? summarizeTaskOutput(outputView) : (task.error || '—')}
+                        </td>
                         <td className="px-4 py-3 text-gray-500 whitespace-nowrap">
                           {formatDate(task.started_at)}
                         </td>
@@ -230,7 +295,7 @@ export default function AgentMonitor() {
                       </tr>
                       {isExpanded && hasOutput && (
                         <tr className="bg-gray-50">
-                          <td colSpan={8} className="px-6 py-4">
+                          <td colSpan={9} className="px-6 py-4">
                             <div className="bg-gray-900 rounded-lg p-4 overflow-x-auto">
                               <pre className="text-xs text-green-300 font-mono whitespace-pre-wrap max-h-64 overflow-y-auto">
                                 {JSON.stringify(outputView, null, 2)}

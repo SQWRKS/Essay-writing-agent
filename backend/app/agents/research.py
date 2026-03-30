@@ -1,13 +1,12 @@
 import json
 import logging
-import math
 import re
 import time
 
 import httpx
 
 from app.agents.base import AgentBase
-from app.agents.llm_client import is_llm_available, timed_chat_completion
+from app.agents.llm_client import is_llm_available, timed_chat_completion, truncate_text
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -47,6 +46,25 @@ MOCK_SOURCES = [
 class ResearchAgent(AgentBase):
     name = "research"
 
+    def _tokenize(self, text: str) -> set[str]:
+        return {
+            token
+            for token in re.findall(r"\b[a-zA-Z][a-zA-Z0-9\-]{2,}\b", (text or "").lower())
+            if len(token) > 3
+        }
+
+    def _query_terms(self, topic: str, queries: list) -> set[str]:
+        terms = set()
+        for chunk in [topic, *queries]:
+            terms.update(self._tokenize(str(chunk)))
+        return terms
+
+    def _is_generic_query(self, query: str) -> bool:
+        """Return True if a query is too generic to benefit from LLM refinement."""
+        generic_suffixes = {"overview", "methods", "introduction", "review", "survey", "basics"}
+        tokens = {t.lower().strip() for t in query.split()}
+        return tokens.issubset(generic_suffixes | {""})
+
     async def execute(self, input_data: dict, project_id: str, db) -> dict:
         await self._update_agent_state(db, project_id, "running")
         topic = input_data.get("topic", "")
@@ -54,9 +72,15 @@ class ResearchAgent(AgentBase):
         sources_list = input_data.get("sources", settings.RESEARCH_SOURCES)
         min_sources = max(10, min(int(input_data.get("min_sources", 14)), 20))
 
-        expanded_queries = self._expand_queries(topic, seed_queries)
-        if is_llm_available() and topic:
-            expanded_queries = await self._llm_refine_queries(expanded_queries, topic, project_id, db)
+        if not queries and topic:
+            queries = [f"{topic} overview", f"{topic} methods"]
+
+        # Use LLM to refine/expand search queries only when the existing queries
+        # are short or generic — this avoids burning tokens when the planner
+        # already produced focused queries.
+        needs_refinement = len(queries) < 3 or all(self._is_generic_query(q) for q in queries[:3])
+        if is_llm_available() and queries and needs_refinement:
+            queries = await self._llm_refine_queries(queries, topic, project_id, db)
 
         all_sources = []
         for source_name in sources_list:
@@ -95,179 +119,88 @@ class ResearchAgent(AgentBase):
         await self._update_agent_state(db, project_id, "completed", result)
         return result
 
-    def _expand_queries(self, topic: str, queries: list[str]) -> list[str]:
-        seeds = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
-        if not seeds and topic:
-            seeds = [topic]
-
-        expanded = list(seeds)
-        if topic:
-            expanded.extend(
-                [
-                    f"{topic} systematic review",
-                    f"{topic} experimental evaluation",
-                    f"{topic} quantitative performance analysis",
-                    f"{topic} implementation challenges",
-                    f"{topic} industry case study",
-                    f"{topic} limitations and future work",
-                    f"{topic} benchmark dataset comparison",
-                    f"{topic} engineering design trade-offs",
-                ]
-            )
-
-        normalized = []
-        seen = set()
-        for query in expanded:
-            key = " ".join(query.lower().split())
-            if key and key not in seen:
-                normalized.append(query)
-                seen.add(key)
-            if len(normalized) >= 10:
-                break
-        return normalized
-
-    def _deduplicate_sources(self, sources: list[dict]) -> list[dict]:
-        seen = set()
-        unique_sources = []
-        for source in sources:
-            key = source.get("doi") or source.get("url") or source.get("title")
-            if key and key not in seen:
-                seen.add(key)
-                unique_sources.append(source)
-        return unique_sources
-
-    def _rank_sources(self, sources: list[dict], topic: str, queries: list[str]) -> list[dict]:
+    def _rank_sources(self, sources: list, topic: str, queries: list) -> list:
+        """Assign a hybrid lexical relevance score and sort sources descending."""
         if not sources:
             return []
 
         current_year = time.gmtime().tm_year
-        topic_terms = self._keyword_set(" ".join([topic, *queries]))
+        query_terms = self._query_terms(topic, queries)
         ranked = []
         for src in sources:
             title = src.get("title") or ""
             abstract = src.get("abstract") or ""
-            combined_text = f"{title} {abstract}".strip()
+            venue = src.get("venue") or ""
 
-            keyword_overlap = self._keyword_overlap_score(combined_text, topic_terms)
-            semantic_similarity = self._semantic_similarity_score(combined_text, topic_terms)
+            title_terms = self._tokenize(title)
+            abstract_terms = self._tokenize(abstract)
+            combined_terms = title_terms | abstract_terms
+
+            title_overlap = len(query_terms & title_terms) / max(3, min(8, len(query_terms) or 1))
+            abstract_overlap = len(query_terms & abstract_terms) / max(4, min(12, len(query_terms) or 1))
+            coverage_score = len(query_terms & combined_terms) / max(4, len(query_terms) or 1)
+            exact_phrase_bonus = 0.15 if topic and topic.lower() in f"{title} {abstract}".lower() else 0.0
 
             year = src.get("year") or 0
             recency_score = 0.0
             if isinstance(year, int) and year > 1900:
                 age = max(0, current_year - year)
-                recency_score = max(0.0, 1.0 - (age / 18.0))
+                recency_score = max(0.0, 1.0 - (age / 15.0))
 
-            completeness = 0.15 if src.get("abstract") else 0.0
-            completeness += 0.1 if src.get("doi") else 0.0
-            source_bonus = 0.08 if src.get("source") in {"arxiv", "semantic_scholar", "web"} else 0.0
+            doi_score = 1.0 if src.get("doi") else 0.0
+            abstract_score = min(1.0, len(abstract.strip()) / 250) if abstract else 0.0
+            author_score = min(1.0, len(src.get("authors") or []) / 3)
+            source_bonus = {
+                "semantic_scholar": 1.0,
+                "web": 0.8,
+                "arxiv": 0.75,
+            }.get(src.get("source"), 0.5)
+            venue_bonus = 0.15 if venue else 0.0
 
+            lexical_score = min(1.0, (title_overlap * 0.45) + (abstract_overlap * 0.35) + (coverage_score * 0.2) + exact_phrase_bonus)
             relevance = round(
-                (keyword_overlap * 0.35)
-                + (semantic_similarity * 0.35)
+                (lexical_score * 0.42)
                 + (recency_score * 0.12)
-                + completeness
-                + source_bonus,
+                + (doi_score * 0.12)
+                + (abstract_score * 0.14)
+                + (author_score * 0.06)
+                + (source_bonus * 0.09)
+                + venue_bonus,
                 3,
             )
+            ranking_features = {
+                "lexical_score": round(lexical_score, 3),
+                "title_overlap": round(min(1.0, title_overlap), 3),
+                "abstract_overlap": round(min(1.0, abstract_overlap), 3),
+                "coverage_score": round(min(1.0, coverage_score), 3),
+                "recency_score": round(recency_score, 3),
+                "metadata_score": round(((doi_score * 0.5) + (abstract_score * 0.35) + (author_score * 0.15)), 3),
+                "source_bonus": round(source_bonus, 3),
+            }
+            match_reasons = []
+            if exact_phrase_bonus:
+                match_reasons.append("topic phrase appears directly in title or abstract")
+            if title_overlap >= 0.2:
+                match_reasons.append("title overlaps with core query terms")
+            if abstract_overlap >= 0.2:
+                match_reasons.append("abstract covers query-specific concepts")
+            if doi_score:
+                match_reasons.append("source includes DOI metadata")
+
             ranked.append(
                 {
                     **src,
-                    "keyword_overlap": round(keyword_overlap, 3),
-                    "semantic_similarity": round(semantic_similarity, 3),
                     "relevance_score": relevance,
+                    "ranking_features": ranking_features,
+                    "match_reasons": match_reasons[:4],
                 }
             )
 
         ranked.sort(key=lambda item: item.get("relevance_score", 0.0), reverse=True)
         return ranked
 
-    def _keyword_set(self, text: str) -> set[str]:
-        return {
-            token
-            for token in re.findall(r"[a-zA-Z][a-zA-Z0-9\-]+", text.lower())
-            if len(token) > 3
-        }
-
-    def _keyword_overlap_score(self, text: str, topic_terms: set[str]) -> float:
-        text_terms = self._keyword_set(text)
-        if not text_terms or not topic_terms:
-            return 0.0
-        return min(1.0, len(text_terms & topic_terms) / max(5, len(topic_terms)))
-
-    def _semantic_similarity_score(self, text: str, topic_terms: set[str]) -> float:
-        text_terms = self._keyword_set(text)
-        if not text_terms or not topic_terms:
-            return 0.0
-
-        intersection = len(text_terms & topic_terms)
-        denominator = math.sqrt(len(text_terms) * len(topic_terms))
-        if denominator == 0:
-            return 0.0
-        return min(1.0, intersection / denominator)
-
-    def _build_structured_summaries(self, ranked_sources: list[dict], topic: str) -> list[dict]:
-        summaries = []
-        for source in ranked_sources:
-            abstract = source.get("abstract") or ""
-            finding = self._extract_key_finding(abstract, source.get("title", ""), topic)
-            quantitative = self._extract_quantitative_data(abstract)
-            summaries.append(
-                {
-                    "source": {
-                        "title": source.get("title", "Unknown"),
-                        "authors": source.get("authors", []),
-                        "year": source.get("year"),
-                        "doi": source.get("doi", ""),
-                        "url": source.get("url", ""),
-                        "source": source.get("source", "unknown"),
-                    },
-                    "key_findings": finding,
-                    "quantitative_data": quantitative,
-                    "relevance_score": source.get("relevance_score", 0.0),
-                }
-            )
-        return summaries
-
-    def _extract_key_finding(self, abstract: str, title: str, topic: str) -> str:
-        cleaned = " ".join((abstract or "").split())
-        if not cleaned:
-            return f"{title or topic} is directly relevant but lacks an abstract for deeper synthesis."
-
-        sentences = re.split(r"(?<=[.!?])\s+", cleaned)
-        for sentence in sentences:
-            lower = sentence.lower()
-            if any(keyword in lower for keyword in ["result", "find", "show", "improv", "reduc", "increase", "outperform"]):
-                return sentence.strip()
-        return sentences[0].strip()
-
-    def _extract_quantitative_data(self, abstract: str) -> list[str]:
-        if not abstract:
-            return []
-        matches = re.findall(r"\b\d+(?:\.\d+)?%?|\b\d+(?:\.\d+)?\s?(?:x|times|fold|samples|participants|epochs|studies|datasets|models)", abstract)
-        deduped = []
-        seen = set()
-        for match in matches:
-            key = match.lower()
-            if key not in seen:
-                deduped.append(match)
-                seen.add(key)
-        return deduped[:5]
-
-    def _compose_summary(self, summaries: list[dict], topic: str) -> str:
-        if not summaries:
-            return ""
-
-        top = summaries[:4]
-        lines = [f"Research on {topic} converges on several recurring engineering and evaluation themes."]
-        for idx, summary in enumerate(top, 1):
-            title = summary["source"].get("title", "Unknown source")
-            finding = summary.get("key_findings", "")
-            quantities = summary.get("quantitative_data", [])
-            quant_line = f" Quantitative signals include {', '.join(quantities[:2])}." if quantities else ""
-            lines.append(f"[{idx}] {title}: {finding}{quant_line}")
-        return " ".join(lines)
-
-    async def _llm_refine_queries(self, queries: list[str], topic: str, project_id: str, db) -> list[str]:
+    async def _llm_refine_queries(self, queries: list, topic: str, project_id: str, db) -> list:
+        """Use LLM to generate focused academic search queries from the input list."""
         try:
             queries_text = "\n".join(f"- {query}" for query in queries[:8])
             prompt = (
@@ -295,10 +228,23 @@ class ResearchAgent(AgentBase):
             logger.warning("LLM query refinement failed (%s); using deterministic expansion.", exc)
         return queries[:10]
 
-    async def _llm_summarize(self, summaries: list[dict], topic: str, project_id: str, db) -> str:
-        if not is_llm_available() or not summaries:
+    async def _llm_summarize(self, sources: list, topic: str, project_id: str, db) -> str:
+        """Use LLM to synthesize a structured research summary from gathered sources."""
+        if not sources:
             return ""
         try:
+            # Limit to 6 sources; truncate abstracts to 200 chars each to reduce prompt tokens
+            sources_text = json.dumps(
+                [
+                    {
+                        "title": s.get("title"),
+                        "year": s.get("year"),
+                        "source": s.get("source"),
+                        "abstract": truncate_text(s.get("abstract", ""), 200),
+                    }
+                    for s in sources[:6]
+                ]
+            )
             prompt = (
                 f"You are synthesising literature for a final-year university paper on '{topic}'. "
                 "Using only the structured summaries provided, write a dense 5-7 sentence literature synthesis. "
@@ -311,8 +257,7 @@ class ResearchAgent(AgentBase):
                 db=db,
                 agent_name=self.name,
                 log_api_call_fn=self._log_api_call,
-                temperature=0.25,
-                max_tokens=800,
+                max_tokens=600,
             )
         except Exception:
             return ""

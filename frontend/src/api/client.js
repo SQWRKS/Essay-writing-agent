@@ -1,8 +1,9 @@
 import axios from 'axios'
 
 const api = axios.create({
-  baseURL: 'http://localhost:8000',
-  timeout: 30000,
+  baseURL: import.meta.env.VITE_API_BASE_URL || '',
+  // Some endpoints can be delayed while long-running generation writes to DB.
+  timeout: 120000,
   headers: {
     'Content-Type': 'application/json',
   },
@@ -11,6 +12,10 @@ const api = axios.create({
 api.interceptors.response.use(
   (response) => response,
   (error) => {
+    if (error.code === 'ECONNABORTED') {
+      return Promise.reject(new Error('Request timed out while waiting for the API. The pipeline may still be running.'))
+    }
+
     const message =
       error.response?.data?.detail ||
       error.response?.data?.message ||
@@ -22,10 +27,31 @@ api.interceptors.response.use(
 
 export const getProjects = () => api.get('/projects')
 
-export const createProject = (title, topic) =>
-  api.post('/projects', { title, topic })
+export const createProject = (title, topic, settings) =>
+  api.post('/projects', {
+    title,
+    topic,
+    ...(settings && Object.keys(settings).length > 0 ? { settings } : {}),
+  })
+
+export const uploadContextFile = (projectId, file) => {
+  const formData = new FormData()
+  formData.append('file', file)
+  // Do NOT set Content-Type manually — axios auto-sets it to
+  // 'multipart/form-data; boundary=<...>' when the body is FormData.
+  // Manually overriding it strips the boundary and breaks the upload.
+  return api.post(`/projects/${projectId}/upload-context`, formData, {
+    timeout: 60000,
+  })
+}
 
 export const getProject = (id) => api.get(`/projects/${id}`)
+
+export const pauseProject = (projectId) =>
+  api.post(`/projects/${projectId}/pause`)
+
+export const deleteProject = (projectId) =>
+  api.delete(`/projects/${projectId}`)
 
 export const runAgent = (projectId, agentName, inputData) =>
   api.post(`/projects/${projectId}/run-agent`, { agent_name: agentName, input_data: inputData })
@@ -45,7 +71,7 @@ export const exportProject = (projectId, format) =>
 export const getLogs = (page = 1, limit = 50) =>
   api.get('/api/logs', { params: { page, limit } })
 
-export const getHealth = () => api.get('/api/health')
+export const getHealth = () => api.get('/api/health', { timeout: 5000 })
 
 export const getConfig = () => api.get('/api/config')
 

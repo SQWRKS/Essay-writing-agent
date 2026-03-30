@@ -1,9 +1,11 @@
 import time
 import os
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from datetime import datetime, timezone
 
 from app.core.config import settings
 from app.core.logging_config import logger
@@ -29,28 +31,36 @@ app.add_middleware(
 )
 
 
+async def _persist_api_log(path: str, method: str, status_code: int, duration_ms: float) -> None:
+    try:
+        async with AsyncSessionLocal() as db:
+            from app.models import ApiLog
+
+            log = ApiLog(
+                endpoint=path,
+                method=method,
+                agent_name=None,
+                duration_ms=duration_ms,
+                status_code=status_code,
+                timestamp=datetime.now(timezone.utc),
+            )
+            db.add(log)
+            await db.commit()
+    except Exception:
+        # Logging must never impact request handling.
+        pass
+
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start = time.monotonic()
     response = await call_next(request)
     duration = (time.monotonic() - start) * 1000
 
-    try:
-        async with AsyncSessionLocal() as db:
-            from app.models import ApiLog
-            from datetime import datetime, timezone
-            log = ApiLog(
-                endpoint=str(request.url.path),
-                method=request.method,
-                agent_name=None,
-                duration_ms=duration,
-                status_code=response.status_code,
-                timestamp=datetime.now(timezone.utc),
-            )
-            db.add(log)
-            await db.commit()
-    except Exception:
-        pass
+    path = str(request.url.path)
+    # Skip high-frequency noise endpoints to reduce lock contention in SQLite.
+    if path != "/api/health" and not path.endswith("/events"):
+        asyncio.create_task(_persist_api_log(path, request.method, response.status_code, duration))
 
     return response
 

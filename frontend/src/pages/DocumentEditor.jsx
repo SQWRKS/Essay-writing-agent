@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams } from 'react-router-dom'
-import { Save, RefreshCw, BookOpen, Quote, AlertCircle, RotateCcw, Image as ImageIcon, Globe } from 'lucide-react'
+import { Save, RefreshCw, BookOpen, Quote, AlertCircle, RotateCcw, Image as ImageIcon, Globe, ShieldCheck, CheckCircle2, GitBranch } from 'lucide-react'
 import api from '../api/client'
 import { getProject, runAgent, updateProjectContent } from '../api/client'
 import LoadingSpinner from '../components/LoadingSpinner'
@@ -100,6 +100,13 @@ function toSectionKey(sectionName) {
     .replace(/^_+|_+$/g, '')
 }
 
+function formatSectionName(sectionKey) {
+  return String(sectionKey || '')
+    .trim()
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (char) => char.toUpperCase())
+}
+
 function parseCitations(project) {
   if (!project) return []
   let content = project.content
@@ -162,8 +169,10 @@ function toFigureUrl(pathOrUrl) {
 
 export default function DocumentEditor() {
   const { id } = useParams()
+  const hasLoadedProjectRef = useRef(false)
   const [project, setProject] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState(null)
   const [sections, setSections] = useState({})
   const [activeSection, setActiveSection] = useState(null)
@@ -173,28 +182,45 @@ export default function DocumentEditor() {
   const [rerunning, setRerunning] = useState(false)
   const [metadata, setMetadata] = useState({})
 
-  const fetchProject = useCallback(async () => {
-    setLoading(true)
-    setError(null)
+  const fetchProject = useCallback(async ({ background = false, silentError = false } = {}) => {
+    if (background) {
+      setRefreshing(true)
+    } else {
+      setLoading(true)
+      setError(null)
+    }
+
     try {
       const res = await getProject(id)
       setProject(res.data)
+      hasLoadedProjectRef.current = true
       const parsed = parseContent(res.data)
       setSections(parsed)
       const envelope = parseContentEnvelope(res.data)
       setMetadata(envelope.metadata || {})
-      if (!activeSection) {
-        const first = Object.keys(parsed)[0] || DEFAULT_SECTIONS[0]
-        setActiveSection(first)
-      }
+      const first = Object.keys(parsed)[0] || DEFAULT_SECTIONS[0]
+      setActiveSection((prev) => prev || first)
     } catch (err) {
-      setError(err.message)
+      if (!silentError && (!background || !hasLoadedProjectRef.current)) {
+        setError(err.message)
+      }
     } finally {
       setLoading(false)
+      setRefreshing(false)
     }
-  }, [id, activeSection])
+  }, [id])
 
   useEffect(() => { fetchProject() }, [fetchProject])
+
+  // Background refresh while generation is running so the editor stays current
+  useEffect(() => {
+    const status = (project?.status || '').toLowerCase()
+    if (status !== 'running' || dirty) return
+    const timer = setInterval(() => {
+      fetchProject({ background: true, silentError: true })
+    }, 30000)
+    return () => clearInterval(timer)
+  }, [project?.status, dirty, fetchProject])
 
   const allSections = [...new Set([
     ...DEFAULT_SECTIONS,
@@ -262,8 +288,14 @@ export default function DocumentEditor() {
   const figures = parseFigures(project)
   const sources = parseSources(project)
   const activeContent = normalizeSectionValue(sections[activeSection])
+  const qualitySections = metadata?.quality?.sections || {}
+  const sectionSubheadings = metadata?.subheadings || {}
+  const qualitySummary = metadata?.quality?.summary || {}
+  const coherence = metadata?.quality?.coherence || null
+  const activeSectionQuality = qualitySections[toSectionKey(activeSection)] || qualitySections[activeSection] || null
+  const activeSubheadings = sectionSubheadings[toSectionKey(activeSection)] || sectionSubheadings[activeSection] || []
 
-  if (loading) return <div className="flex justify-center py-20"><LoadingSpinner size="lg" /></div>
+  if (loading && !project) return <div className="flex justify-center py-20"><LoadingSpinner size="lg" /></div>
   if (error) return (
     <div className="max-w-xl mx-auto mt-12 bg-red-50 border border-red-200 rounded-xl p-6 text-center">
       <AlertCircle className="mx-auto mb-2 text-red-500" size={32} />
@@ -284,8 +316,11 @@ export default function DocumentEditor() {
           {dirty && (
             <span className="text-xs text-yellow-600 bg-yellow-50 px-2 py-1 rounded">Unsaved changes</span>
           )}
+          {refreshing && (
+            <span className="text-xs text-gray-500 bg-gray-100 px-2 py-1 rounded">Updating…</span>
+          )}
           <button
-            onClick={fetchProject}
+            onClick={() => fetchProject({ background: true })}
             className="flex items-center gap-1.5 px-3 py-2 text-sm text-gray-600 hover:text-gray-900 border border-gray-200 rounded-lg hover:bg-gray-50"
           >
             <RefreshCw size={14} />
@@ -321,6 +356,8 @@ export default function DocumentEditor() {
           <ul className="p-2 space-y-0.5">
             {allSections.map((sec) => {
               const wc = wordCount(sections[sec])
+              const secQuality = qualitySections[toSectionKey(sec)] || qualitySections[sec]
+              const secSubheadings = sectionSubheadings[toSectionKey(sec)] || sectionSubheadings[sec] || []
               return (
                 <li key={sec}>
                   <button
@@ -331,10 +368,16 @@ export default function DocumentEditor() {
                         : 'text-gray-700 hover:bg-gray-100'
                     }`}
                   >
-                    <span className="block truncate">{sec}</span>
-                    <span className={`text-xs ${activeSection === sec ? 'text-primary-200' : 'text-gray-400'}`}>
-                      {wc} words
-                    </span>
+                    <span className="block truncate">{formatSectionName(sec)}</span>
+                    <div className={`text-xs mt-1 ${activeSection === sec ? 'text-primary-200' : 'text-gray-400'}`}>
+                      <span>{wc} words</span>
+                      {secQuality?.score != null && (
+                        <span className="ml-2">score {secQuality.score}</span>
+                      )}
+                      {Array.isArray(secSubheadings) && secSubheadings.length > 0 && (
+                        <span className="ml-2">sub {secSubheadings.length}</span>
+                      )}
+                    </div>
                   </button>
                 </li>
               )
@@ -345,7 +388,14 @@ export default function DocumentEditor() {
         {/* Editor */}
         <div className="flex-1 flex flex-col bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
           <div className="flex items-center justify-between px-5 py-3 border-b border-gray-100">
-            <h2 className="font-semibold text-gray-900">{activeSection}</h2>
+            <div>
+              <h2 className="font-semibold text-gray-900">{formatSectionName(activeSection)}</h2>
+              {activeSectionQuality && (
+                <p className="text-xs text-gray-500 mt-1">
+                  Score {activeSectionQuality.score ?? '—'} · Grounding {activeSectionQuality.grounding_score ?? '—'} · {activeSectionQuality.revision_attempts ?? 0} revisions
+                </p>
+              )}
+            </div>
             <div className="flex items-center gap-3">
               <span className="text-xs text-gray-400">{wordCount(activeContent)} words</span>
               <button
@@ -368,6 +418,105 @@ export default function DocumentEditor() {
 
         {/* Citations Panel */}
         <div className="w-64 shrink-0 bg-white rounded-xl border border-gray-200 shadow-sm overflow-y-auto scrollbar-thin">
+          <div className="px-4 py-3 border-b border-gray-100">
+            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider flex items-center gap-1.5">
+              <ShieldCheck size={12} /> Quality
+            </p>
+          </div>
+          <div className="p-3 space-y-3 border-b border-gray-100">
+            <div className="rounded-lg border border-gray-100 bg-gray-50 p-3">
+              <p className="text-[11px] uppercase tracking-wider text-gray-500 font-semibold">Document Summary</p>
+              <p className="mt-2 text-sm font-semibold text-gray-900">Average score {qualitySummary.average_score ?? '—'}</p>
+              <p className="text-xs text-gray-500 mt-1">
+                {qualitySummary.approved_sections ?? 0} approved · {qualitySummary.flagged_sections ?? 0} flagged
+              </p>
+            </div>
+
+            {coherence && (
+              <div className="rounded-lg border border-gray-100 bg-gray-50 p-3 space-y-1.5">
+                <p className="text-[11px] uppercase tracking-wider text-gray-500 font-semibold flex items-center gap-1">
+                  <GitBranch size={11} /> Coherence
+                </p>
+                <p className="text-sm font-semibold text-gray-900">Score {coherence.score ?? qualitySummary.coherence_score ?? '—'}</p>
+                <p className="text-xs text-gray-600">Topic coverage {coherence.topic_coverage ?? '—'}</p>
+                {(coherence.flagged_sections?.length || 0) > 0 && (
+                  <p className="text-xs text-amber-700">Flagged: {coherence.flagged_sections.join(', ')}</p>
+                )}
+              </div>
+            )}
+
+            {!activeSectionQuality ? (
+              <p className="text-xs text-gray-400">No section quality data available yet.</p>
+            ) : (
+              <>
+                <div className="rounded-lg border border-gray-100 bg-gray-50 p-3 space-y-1.5">
+                  <p className="text-[11px] uppercase tracking-wider text-gray-500 font-semibold">Active Section</p>
+                  <p className="text-sm font-semibold text-gray-900">{activeSectionQuality.title || formatSectionName(activeSection)}</p>
+                  <p className="text-xs text-gray-600">Reviewer {activeSectionQuality.score ?? '—'} · Grounding {activeSectionQuality.grounding_score ?? '—'}</p>
+                  <p className="text-xs text-gray-600">{activeSectionQuality.actual_word_count ?? wordCount(activeContent)} words · {activeSectionQuality.citation_count ?? 0} citations</p>
+                  <p className="text-xs text-gray-600">Evidence {activeSectionQuality.evidence_count ?? '—'} · Stop {activeSectionQuality.stop_reason || '—'}</p>
+                </div>
+
+                {Array.isArray(activeSubheadings) && activeSubheadings.length > 0 && (
+                  <div>
+                    <p className="text-[11px] uppercase tracking-wider text-indigo-700 font-semibold mb-1.5">Subheadings</p>
+                    <ul className="space-y-1 text-xs text-indigo-700">
+                      {activeSubheadings.slice(0, 2).map((item, index) => (
+                        <li key={`subheading-${index}`}>• {item?.title || `Subheading ${index + 1}`}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {activeSectionQuality.strengths?.length > 0 && (
+                  <div>
+                    <p className="text-[11px] uppercase tracking-wider text-green-700 font-semibold mb-1.5 flex items-center gap-1">
+                      <CheckCircle2 size={11} /> Strengths
+                    </p>
+                    <ul className="space-y-1 text-xs text-green-700">
+                      {activeSectionQuality.strengths.slice(0, 3).map((item, index) => (
+                        <li key={`strength-${index}`}>• {item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {((activeSectionQuality.blocking_issues?.length || 0) > 0 || (activeSectionQuality.grounding_issues?.length || 0) > 0) && (
+                  <div>
+                    <p className="text-[11px] uppercase tracking-wider text-amber-700 font-semibold mb-1.5">Issues</p>
+                    <ul className="space-y-1 text-xs text-amber-700">
+                      {[...(activeSectionQuality.blocking_issues || []), ...(activeSectionQuality.grounding_issues || [])].slice(0, 4).map((item, index) => (
+                        <li key={`issue-${index}`}>• {item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {activeSectionQuality.suggestions?.length > 0 && (
+                  <div>
+                    <p className="text-[11px] uppercase tracking-wider text-blue-700 font-semibold mb-1.5">Revision Guidance</p>
+                    <ul className="space-y-1 text-xs text-blue-700">
+                      {activeSectionQuality.suggestions.slice(0, 4).map((item, index) => (
+                        <li key={`suggestion-${index}`}>• {item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {coherence?.suggestions?.length > 0 && (
+                  <div>
+                    <p className="text-[11px] uppercase tracking-wider text-purple-700 font-semibold mb-1.5">Whole-Essay Guidance</p>
+                    <ul className="space-y-1 text-xs text-purple-700">
+                      {coherence.suggestions.slice(0, 3).map((item, index) => (
+                        <li key={`coherence-suggestion-${index}`}>• {item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
           <div className="px-4 py-3 border-b border-gray-100">
             <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider flex items-center gap-1.5">
               <Quote size={12} /> Citations
