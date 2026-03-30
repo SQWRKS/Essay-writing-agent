@@ -42,6 +42,7 @@ class ReviewerAgent(AgentBase):
         evidence_pack = input_data.get("evidence_pack", [])
         grounding_summary = input_data.get("grounding_summary", {})
         revision_attempt = int(input_data.get("revision_attempt", 0))
+        rubric: str = (input_data.get("rubric") or "").strip()
 
         if is_llm_available():
             result = await self._llm_review(
@@ -53,9 +54,13 @@ class ReviewerAgent(AgentBase):
                 revision_attempt,
                 project_id,
                 db,
+                rubric=rubric,
             )
         else:
-            result = self._heuristic_review(section, content, expected_word_count, evidence_pack, grounding_summary, revision_attempt)
+            result = self._heuristic_review(
+                section, content, expected_word_count, evidence_pack,
+                grounding_summary, revision_attempt, rubric=rubric,
+            )
 
         await self._update_agent_state(db, project_id, "completed", result)
         return result
@@ -99,6 +104,7 @@ class ReviewerAgent(AgentBase):
         evidence_pack: list[dict] | None = None,
         grounding_summary: dict | None = None,
         revision_attempt: int = 0,
+        rubric: str = "",
     ) -> dict:
         evidence_pack = evidence_pack or []
         grounding_summary = grounding_summary or {}
@@ -239,6 +245,7 @@ class ReviewerAgent(AgentBase):
         revision_attempt: int,
         project_id: str,
         db,
+        rubric: str = "",
     ) -> dict:
         try:
             evidence_digest = json.dumps([
@@ -250,6 +257,8 @@ class ReviewerAgent(AgentBase):
                 }
                 for item in evidence_pack[:3]
             ])
+            # Optional rubric block — only added when the user supplied one
+            rubric_block = f"MARKING RUBRIC:\n{rubric[:800]}\nEvaluate the section against the above rubric criteria in addition to standard quality dimensions.\n\n" if rubric else ""
             # Truncate content to 2500 chars to reduce prompt tokens while
             # still giving the reviewer enough text to evaluate quality.
             prompt = (
@@ -259,6 +268,7 @@ class ReviewerAgent(AgentBase):
                 "Reject if generic, weakly grounded, underdeveloped, or lacking evidence citations.\n\n"
                 "Return JSON: score (float), approved (bool), feedback (string), "
                 "suggestions (array), strengths (array), blocking_issues (array), category_scores (object).\n\n"
+                f"{rubric_block}"
                 f"Grounding summary: {json.dumps(grounding_summary)}\n"
                 f"Evidence pack: {evidence_digest}\n\n"
                 f"Content:\n{truncate_text(content, 2500)}"
@@ -285,4 +295,4 @@ class ReviewerAgent(AgentBase):
             result["grounding_score"] = round(float(grounding_summary.get("score", 0.0)), 2)
             return result
         except Exception:
-            return self._heuristic_review(section, content, expected_word_count, evidence_pack, grounding_summary, revision_attempt)
+            return self._heuristic_review(section, content, expected_word_count, evidence_pack, grounding_summary, revision_attempt, rubric=rubric)

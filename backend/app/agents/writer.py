@@ -109,6 +109,7 @@ class WriterAgent(AgentBase):
         research_data = input_data.get("research_data", {})
         section_plan = input_data.get("section_plan", {})
         feedback = input_data.get("feedback", "")
+        writing_style: str = (input_data.get("writing_style") or "").strip()
 
         if not is_llm_available():
             raise RuntimeError(
@@ -116,7 +117,10 @@ class WriterAgent(AgentBase):
                 "Set OPENAI_API_KEY or ANTHROPIC_API_KEY before running the pipeline."
             )
 
-        result = await self._llm_write(section, topic, word_count_target, research_data, section_plan, feedback, project_id, db)
+        result = await self._llm_write(
+            section, topic, word_count_target, research_data, section_plan,
+            feedback, project_id, db, writing_style=writing_style,
+        )
 
         await self._update_agent_state(db, project_id, "completed", result)
         return result
@@ -238,6 +242,7 @@ class WriterAgent(AgentBase):
         feedback: str,
         project_id: str,
         db,
+        writing_style: str = "",
     ) -> dict:
         try:
             section_plan = section_plan or {}
@@ -254,12 +259,15 @@ class WriterAgent(AgentBase):
             evidence_requirements = section_plan.get("evidence_requirements", [])
             writing_directive = section_plan.get("writing_directive", "")
             subheading_hints = section_plan.get("subheading_hints", [])[:2]
+            # Optional writing-style directive line (empty string → omitted cleanly)
+            style_line = f"WRITING STYLE: {writing_style}\n" if writing_style else ""
             prompt = (
                 f"Write the '{section}' section (~{word_count_target} words) of an academic essay on '{topic}'.\n\n"
                 f"SECTION OBJECTIVE: {thesis_goal}\n"
                 f"MUST COVER: {'; '.join(str(i) for i in must_cover)}\n"
                 f"EVIDENCE REQUIREMENTS: {'; '.join(str(i) for i in evidence_requirements)}\n"
                 f"WRITING DIRECTIVE: {writing_directive}\n"
+                f"{style_line}"
                 f"SUBHEADINGS (optional, max 2): {', '.join(subheading_hints) if subheading_hints else 'None'}\n\n"
                 f"RESEARCH SYNTHESIS:\n{research_summary}\n\n"
                 f"EVIDENCE PACK (JSON):\n{evidence_summary}\n\n"

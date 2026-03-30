@@ -27,8 +27,21 @@ api.interceptors.response.use(
 
 export const getProjects = () => api.get('/projects')
 
-export const createProject = (title, topic) =>
-  api.post('/projects', { title, topic })
+export const createProject = (title, topic, settings) =>
+  api.post('/projects', {
+    title,
+    topic,
+    ...(settings && Object.keys(settings).length > 0 ? { settings } : {}),
+  })
+
+export const uploadContextFile = (projectId, file) => {
+  const formData = new FormData()
+  formData.append('file', file)
+  return api.post(`/projects/${projectId}/upload-context`, formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 60000,
+  })
+}
 
 export const getProject = (id) => api.get(`/projects/${id}`)
 

@@ -47,3 +47,11 @@ async def init_db():
     async with engine.begin() as conn:
         from app import models  # noqa: F401
         await conn.run_sync(Base.metadata.create_all)
+        # Safe migration: add settings_json to existing SQLite databases.
+        # create_all only adds new tables, not new columns on existing ones.
+        if settings.DATABASE_URL.startswith("sqlite"):
+            from sqlalchemy import text
+            try:
+                await conn.execute(text("ALTER TABLE projects ADD COLUMN settings_json TEXT"))
+            except Exception:
+                pass  # Column already exists — no action needed.

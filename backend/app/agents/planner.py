@@ -160,7 +160,7 @@ class PlannerAgent(AgentBase):
             normalized["subheading_hints"] = [str(normalized["subheading_hints"])]
         return normalized
 
-    def _normalize_plan(self, plan: dict) -> dict:
+    def _normalize_plan(self, plan: dict, word_count_target: int | None = None) -> dict:
         raw_sections = plan.get("sections") or []
         sections = []
         fallback_map = {item["key"]: item for item in SECTION_TEMPLATES}
@@ -179,6 +179,13 @@ class PlannerAgent(AgentBase):
         if not sections:
             sections = [self._normalize_section_plan({}, SECTION_TEMPLATES[0])]
 
+        # Scale section word counts when a total word-count target is provided.
+        if word_count_target and word_count_target > 0:
+            default_total = sum(s["word_count_target"] for s in sections) or 1
+            scale = word_count_target / default_total
+            for section in sections:
+                section["word_count_target"] = max(80, int(section["word_count_target"] * scale))
+
         research_queries = plan.get("research_queries") or []
         if not isinstance(research_queries, list):
             research_queries = [str(research_queries)]
@@ -196,16 +203,34 @@ class PlannerAgent(AgentBase):
     async def execute(self, input_data: dict, project_id: str, db) -> dict:
         await self._update_agent_state(db, project_id, "running")
         topic = input_data.get("topic", "")
+        # Optional fine-tune settings — all default to None / "" (no-op)
+        word_count_target: int | None = input_data.get("word_count_target")
+        writing_style: str = (input_data.get("writing_style") or "").strip()
+        context_text: str = (input_data.get("context_text") or "").strip()
 
         if is_llm_available():
-            result = await self._llm_plan(topic, project_id, db)
+            result = await self._llm_plan(
+                topic, project_id, db,
+                word_count_target=word_count_target,
+                writing_style=writing_style,
+                context_text=context_text,
+            )
         else:
-            result = self._template_plan(topic)
+            result = self._template_plan(
+                topic,
+                word_count_target=word_count_target,
+                writing_style=writing_style,
+            )
 
         await self._update_agent_state(db, project_id, "completed", result)
         return result
 
-    def _template_plan(self, topic: str) -> dict:
+    def _template_plan(
+        self,
+        topic: str,
+        word_count_target: int | None = None,
+        writing_style: str = "",
+    ) -> dict:
         sections = []
         all_queries = []
         for tmpl in SECTION_TEMPLATES:
@@ -214,7 +239,7 @@ class PlannerAgent(AgentBase):
                 f"recent advances in {topic} {tmpl['key']}",
                 f"{topic} {tmpl['key']} methodology best practices",
             ]
-            sections.append({
+            section = {
                 "key": tmpl["key"],
                 "title": tmpl["title"],
                 "description": tmpl["description"],
@@ -224,18 +249,49 @@ class PlannerAgent(AgentBase):
                 "must_cover": tmpl["must_cover"],
                 "evidence_requirements": tmpl["evidence_requirements"],
                 "writing_directive": tmpl["writing_directive"],
-            })
+            }
+            if writing_style:
+                section["writing_directive"] = (
+                    f"{section['writing_directive']} Adopt a {writing_style} tone throughout."
+                )
+            sections.append(section)
             all_queries.extend(queries)
         return self._normalize_plan({
             "sections": sections,
             "research_queries": list(set(all_queries)),
             "estimated_total_words": sum(s["word_count_target"] for s in sections),
-        })
+        }, word_count_target=word_count_target)
 
-    async def _llm_plan(self, topic: str, project_id: str, db) -> dict:
+    async def _llm_plan(
+        self,
+        topic: str,
+        project_id: str,
+        db,
+        word_count_target: int | None = None,
+        writing_style: str = "",
+        context_text: str = "",
+    ) -> dict:
         try:
+            context_block = ""
+            if context_text:
+                context_block = (
+                    f"\nADDITIONAL CONTEXT PROVIDED BY USER:\n{context_text[:1500]}\n"
+                    "Integrate the above context naturally into the essay plan where relevant.\n"
+                )
+            word_count_block = ""
+            if word_count_target:
+                word_count_block = (
+                    f"\nTARGET TOTAL WORD COUNT: {word_count_target} words. "
+                    "Scale section word_count_target values proportionally to reach this total.\n"
+                )
+            style_block = ""
+            if writing_style:
+                style_block = (
+                    f"\nWRITING STYLE: Each section's writing_directive must reflect a {writing_style} tone.\n"
+                )
             prompt = (
-                f"Create a detailed academic essay plan tailored to the topic: '{topic}'.\n\n"
+                f"Create a detailed academic essay plan tailored to the topic: '{topic}'.\n"
+                f"{context_block}{word_count_block}{style_block}\n"
                 "Return a JSON object with keys: sections (list), research_queries (list), estimated_total_words (int).\n"
                 "Each section must have:\n"
                 "  key (snake_case), title, description, research_queries (list of 3 precise academic queries),\n"
@@ -258,6 +314,6 @@ class PlannerAgent(AgentBase):
                 log_api_call_fn=self._log_api_call,
                 response_format={"type": "json_object"},
             )
-            return self._normalize_plan(json.loads(content))
+            return self._normalize_plan(json.loads(content), word_count_target=word_count_target)
         except Exception:
-            return self._template_plan(topic)
+            return self._template_plan(topic, word_count_target=word_count_target, writing_style=writing_style)

@@ -75,9 +75,44 @@ class WorkerPool:
             "trend_label": "Publications",
         }
 
-    async def execute_project_pipeline(self, project_id: str, topic: str, db: AsyncSession):
+    async def execute_project_pipeline(
+        self,
+        project_id: str,
+        topic: str,
+        db: AsyncSession,
+        project_settings: dict | None = None,
+    ):
+        """Run the full multi-agent pipeline for *project_id*.
+
+        Parameters
+        ----------
+        project_id:
+            UUID of the project record.
+        topic:
+            Essay topic string.
+        db:
+            Active async SQLAlchemy session.
+        project_settings:
+            Optional fine-tune settings dict (from ``Project.settings_json``).
+            All keys are optional; omitting them preserves the original
+            pipeline defaults.  Recognised keys:
+
+            * ``word_count_target`` (int) — target total word count; section
+              targets are scaled proportionally.
+            * ``writing_style`` (str) — style / tone hint for the writer.
+            * ``context_text`` (str) — additional background context prepended
+              to topic for the planner and research queries.
+            * ``rubric`` (str) — marking rubric used by the reviewer.
+        """
         from app.models import Project, Task
         from app.agents import AGENT_REGISTRY
+
+        # ---- Unpack fine-tune settings (all optional, all have safe defaults) ----
+        ps: dict = project_settings or {}
+        ft_word_count: int | None = ps.get("word_count_target")  # None → use per-section defaults
+        ft_writing_style: str = (ps.get("writing_style") or "").strip()
+        ft_context_text: str = (ps.get("context_text") or "").strip()
+        ft_rubric: str = (ps.get("rubric") or "").strip()
 
         # Update project status
         result = await db.execute(select(Project).where(Project.id == project_id))
@@ -112,11 +147,18 @@ class WorkerPool:
 
         try:
             # --- PLANNER ---
-            planner_task = await self._create_task(db, project_id, "planner", {"topic": topic}, [])
+            planner_input: dict = {"topic": topic}
+            if ft_word_count:
+                planner_input["word_count_target"] = ft_word_count
+            if ft_writing_style:
+                planner_input["writing_style"] = ft_writing_style
+            if ft_context_text:
+                planner_input["context_text"] = ft_context_text
+            planner_task = await self._create_task(db, project_id, "planner", planner_input, [])
             graph.add_task(planner_task.id, "planner")
             await db.commit()
 
-            plan_result = await self._run_task(planner_task, db, project_id, {"topic": topic})
+            plan_result = await self._run_task(planner_task, db, project_id, planner_input)
             graph.mark_completed(planner_task.id)
             plan = plan_result or {}
 
@@ -264,6 +306,9 @@ class WorkerPool:
                         "research_summary": research_result.get("summary", ""),
                     },
                 }
+                # Inject optional fine-tune settings (no-op when empty)
+                if ft_writing_style:
+                    writer_input["writing_style"] = ft_writing_style
                 writer_task = await self._create_task(db, project_id, "writer", writer_input, [verify_task.id])
                 graph.add_task(writer_task.id, "writer", [verify_task.id])
                 await db.commit()
@@ -298,6 +343,8 @@ class WorkerPool:
                     "grounding_summary": grounding_result,
                     "revision_attempt": revision_attempts_used,
                 }
+                if ft_rubric:
+                    review_input["rubric"] = ft_rubric
                 reviewer_task = await self._create_task(db, project_id, "reviewer", review_input, [writer_task.id])
                 graph.add_task(reviewer_task.id, "reviewer", [writer_task.id])
                 await db.commit()
@@ -364,6 +411,8 @@ class WorkerPool:
                         "grounding_summary": reground_result,
                         "revision_attempt": revision_attempts_used,
                     }
+                    if ft_rubric:
+                        re_review_input["rubric"] = ft_rubric
                     re_review_task = await self._create_task(db, project_id, "reviewer", re_review_input, [writer_task2.id])
                     graph.add_task(re_review_task.id, "reviewer", [writer_task2.id])
                     await db.commit()
@@ -550,6 +599,8 @@ class WorkerPool:
                         "grounding_summary": reground_result,
                         "revision_attempt": int(section_quality.get("revision_attempts", 0)) + 1,
                     }
+                    if ft_rubric:
+                        re_review_input["rubric"] = ft_rubric
                     coherence_reviewer_task = await self._create_task(db, project_id, "reviewer", re_review_input, [coherence_writer_task.id])
                     graph.add_task(coherence_reviewer_task.id, "reviewer", [coherence_writer_task.id])
                     await db.commit()

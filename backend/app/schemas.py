@@ -3,9 +3,42 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 
 
+class ProjectSettings(BaseModel):
+    """Fine-tune settings for project generation.  Every field is optional.
+
+    If a field is omitted the pipeline uses its built-in default, so the
+    system behaves identically to before when no settings are provided.
+    """
+
+    word_count_target: Optional[int] = Field(
+        None,
+        ge=100,
+        le=50000,
+        description="Target total word count for the essay.  Section targets "
+                    "are scaled proportionally when this is set.",
+    )
+    writing_style: Optional[str] = Field(
+        None,
+        description="Writing style / tone hint passed to the writer agent "
+                    "(e.g. 'academic', 'argumentative', 'persuasive', 'analytical').",
+    )
+    context_text: Optional[str] = Field(
+        None,
+        description="Additional background context or domain knowledge "
+                    "supplied by the user.  Prepended to the topic for the "
+                    "planner and research queries.",
+    )
+    rubric: Optional[str] = Field(
+        None,
+        description="Marking rubric or grading criteria.  The reviewer agent "
+                    "uses these criteria when evaluating each section.",
+    )
+
+
 class ProjectCreate(BaseModel):
     title: str
     topic: str
+    settings: Optional[ProjectSettings] = None
 
 
 class ProjectUpdate(BaseModel):
@@ -23,6 +56,7 @@ class ProjectRead(BaseModel):
     created_at: datetime
     updated_at: datetime
     content: Optional[str] = None
+    settings_json: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
