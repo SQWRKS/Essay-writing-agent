@@ -22,6 +22,11 @@ from app.routing.model_config import ROUTER_MODEL
 
 logger = logging.getLogger(__name__)
 
+# Maximum characters of cheap-model output included in the routing prompt.
+# Keeping this bounded prevents the routing call itself from becoming
+# expensive on unusually long outputs.
+_ROUTER_MAX_OUTPUT_CHARS: int = 2000
+
 # ---------------------------------------------------------------------------
 # Router prompt (exact text as specified)
 # ---------------------------------------------------------------------------
@@ -79,7 +84,7 @@ async def route_task(task_type: str, input_text: str, cheap_model_output: str) -
     prompt = _ROUTER_PROMPT_TEMPLATE.format(
         task_type=task_type,
         # Cap the evaluated output to keep the routing call cheap
-        model_output=cheap_model_output[:2000],
+        model_output=cheap_model_output[:_ROUTER_MAX_OUTPUT_CHARS],
     )
 
     try:

@@ -197,3 +197,20 @@ def test_router_prompt_contains_required_fields():
     assert "multi-step logic" in prompt
     assert "university-level essay" in prompt
     assert "JSON" in prompt
+
+
+@pytest.mark.asyncio
+async def test_route_task_accepts_input_text_parameter():
+    """route_task must accept input_text without raising; it is reserved for future use."""
+    from app.routing.router import route_task
+    escalate_response = json.dumps({"escalate": False, "reason": "sufficient"})
+    with patch("app.agents.llm_client.is_llm_available", return_value=True), \
+         patch("app.agents.llm_client.chat_completion", new=AsyncMock(return_value=escalate_response)):
+        # input_text is passed but currently not embedded in the prompt —
+        # ensure no TypeError or similar is raised
+        result = await route_task(
+            task_type="citation formatting",
+            input_text="Format these citations in Harvard style.",
+            cheap_model_output="[1] Smith (2020) 'Title'.",
+        )
+    assert result is False
