@@ -4,6 +4,7 @@ import re
 import time
 from app.agents.base import AgentBase
 from app.agents.llm_client import is_llm_available, timed_chat_completion
+from app.routing.model_config import AGENT_MODELS
 
 logger = logging.getLogger(__name__)
 
@@ -148,54 +149,144 @@ class VerificationAgent(AgentBase):
     async def _llm_assess_credibility(self, sources: list, project_id: str, db) -> list:
         """Use LLM to assess and annotate source credibility.
 
+        Two-pass strategy:
+        1. **Flagging pass** (gpt-5-mini / cheap model) — quickly identifies
+           sources that may have credibility concerns.
+        2. **Deep assessment pass** (gpt-5 / expensive model) — only applied to
+           sources flagged as potentially problematic, keeping cost low.
+
         Limited to the top 8 sources and truncated abstracts (150 chars) to keep
-        the prompt compact.
+        the prompts compact.
         """
+        if not sources:
+            return sources
+
+        top_sources = sources[:8]
+        sources_text = json.dumps(
+            [
+                {
+                    "title": s.get("title"),
+                    "authors": s.get("authors"),
+                    "year": s.get("year"),
+                    "abstract": (s.get("abstract", "") or "")[:150],
+                    "doi": s.get("doi"),
+                }
+                for s in top_sources
+            ]
+        )
+
+        # ------------------------------------------------------------------
+        # Pass 1: cheap flagging pass (gpt-5-mini)
+        # ------------------------------------------------------------------
+        flagged_indices: list[int] = []
         try:
-            sources_text = json.dumps(
-                [
-                    {
-                        "title": s.get("title"),
-                        "authors": s.get("authors"),
-                        "year": s.get("year"),
-                        "abstract": (s.get("abstract", "") or "")[:150],
-                        "doi": s.get("doi"),
-                    }
-                    for s in sources[:8]
-                ]
-            )
-            prompt = (
-                "You are an academic librarian evaluating research sources. "
-                "For each source in the JSON list below, assess its credibility and return a JSON array "
-                "where each element has: credibility_notes (string, max 50 words), credibility_boost (float -0.1 to 0.1).\n\n"
+            flag_prompt = (
+                "You are a quick-check academic librarian. "
+                "For each source in the JSON list below, output a JSON array where each element has: "
+                "index (int, 0-based), flag (bool — true if the source has any credibility concern "
+                "such as missing DOI, anonymous authors, very old year, or suspicious title).\n\n"
                 f"Sources:\n{sources_text}"
             )
-            content = await timed_chat_completion(
-                prompt,
+            flag_content = await timed_chat_completion(
+                flag_prompt,
                 db=db,
                 agent_name=self.name,
                 log_api_call_fn=self._log_api_call,
-                max_tokens=1024,
+                model=AGENT_MODELS["verification"]["cheap"],
+                max_tokens=256,
             )
-            assessments = json.loads(content)
-            if not isinstance(assessments, list):
-                logger.warning("LLM credibility assessment returned non-list; skipping.")
-                return sources
-            if len(assessments) != len(sources):
-                logger.warning(
-                    "LLM credibility assessment count mismatch: expected %d, got %d; applying available assessments.",
-                    len(sources),
-                    len(assessments),
+            flags = json.loads(flag_content)
+            if isinstance(flags, list):
+                flagged_indices = [
+                    int(item["index"])
+                    for item in flags
+                    if isinstance(item, dict) and item.get("flag") and "index" in item
+                ]
+        except Exception as exc:
+            logger.warning("Verification flagging pass failed (%s); proceeding without flags.", exc)
+
+        # ------------------------------------------------------------------
+        # Pass 2: deep assessment (gpt-5) for flagged sources only
+        # ------------------------------------------------------------------
+        try:
+            if flagged_indices:
+                flagged_sources = [top_sources[i] for i in flagged_indices if i < len(top_sources)]
+                deep_text = json.dumps(
+                    [
+                        {
+                            "title": s.get("title"),
+                            "authors": s.get("authors"),
+                            "year": s.get("year"),
+                            "abstract": (s.get("abstract", "") or "")[:150],
+                            "doi": s.get("doi"),
+                        }
+                        for s in flagged_sources
+                    ]
                 )
-            for source, assessment in zip(sources, assessments):
-                boost = float(assessment.get("credibility_boost", 0.0))
-                source["verification_score"] = round(
-                    min(1.0, max(0.0, source["verification_score"] + boost)), 3
+                deep_prompt = (
+                    "You are an academic librarian evaluating research sources that have been flagged for review. "
+                    "For each source in the JSON list below, assess its credibility and return a JSON array "
+                    "where each element has: credibility_notes (string, max 50 words), credibility_boost (float -0.1 to 0.1).\n\n"
+                    f"Sources:\n{deep_text}"
                 )
-                source["credibility_notes"] = assessment.get("credibility_notes", "")
-                source["credibility_label"] = (
-                    "high" if source["verification_score"] >= 0.8 else "medium" if source["verification_score"] >= 0.65 else "low"
+                deep_content = await timed_chat_completion(
+                    deep_prompt,
+                    db=db,
+                    agent_name=self.name,
+                    log_api_call_fn=self._log_api_call,
+                    model=AGENT_MODELS["verification"]["expensive"],
+                    max_tokens=1024,
                 )
+                assessments = json.loads(deep_content)
+                if isinstance(assessments, list):
+                    for flagged_source, assessment in zip(flagged_sources, assessments):
+                        boost = float(assessment.get("credibility_boost", 0.0))
+                        flagged_source["verification_score"] = round(
+                            min(1.0, max(0.0, flagged_source["verification_score"] + boost)), 3
+                        )
+                        flagged_source["credibility_notes"] = assessment.get("credibility_notes", "")
+                        flagged_source["credibility_label"] = (
+                            "high"
+                            if flagged_source["verification_score"] >= 0.8
+                            else "medium"
+                            if flagged_source["verification_score"] >= 0.65
+                            else "low"
+                        )
+            else:
+                # No flagged sources — run a lightweight bulk assessment with cheap model
+                prompt = (
+                    "You are an academic librarian evaluating research sources. "
+                    "For each source in the JSON list below, assess its credibility and return a JSON array "
+                    "where each element has: credibility_notes (string, max 50 words), credibility_boost (float -0.1 to 0.1).\n\n"
+                    f"Sources:\n{sources_text}"
+                )
+                content = await timed_chat_completion(
+                    prompt,
+                    db=db,
+                    agent_name=self.name,
+                    log_api_call_fn=self._log_api_call,
+                    model=AGENT_MODELS["verification"]["cheap"],
+                    max_tokens=1024,
+                )
+                assessments = json.loads(content)
+                if not isinstance(assessments, list):
+                    logger.warning("LLM credibility assessment returned non-list; skipping.")
+                    return sources
+                if len(assessments) != len(top_sources):
+                    logger.warning(
+                        "LLM credibility assessment count mismatch: expected %d, got %d; applying available assessments.",
+                        len(top_sources),
+                        len(assessments),
+                    )
+                for source, assessment in zip(top_sources, assessments):
+                    boost = float(assessment.get("credibility_boost", 0.0))
+                    source["verification_score"] = round(
+                        min(1.0, max(0.0, source["verification_score"] + boost)), 3
+                    )
+                    source["credibility_notes"] = assessment.get("credibility_notes", "")
+                    source["credibility_label"] = (
+                        "high" if source["verification_score"] >= 0.8 else "medium" if source["verification_score"] >= 0.65 else "low"
+                    )
         except Exception:
             pass
         return sources

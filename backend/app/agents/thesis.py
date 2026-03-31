@@ -3,6 +3,7 @@ import re
 
 from app.agents.base import AgentBase
 from app.agents.llm_client import is_llm_available, timed_chat_completion
+from app.routing.model_config import AGENT_MODELS
 
 
 class ThesisAgent(AgentBase):
@@ -75,6 +76,7 @@ class ThesisAgent(AgentBase):
                 db=db,
                 agent_name=self.name,
                 log_api_call_fn=self._log_api_call,
+                model=AGENT_MODELS["thesis"]["default"],
                 response_format={"type": "json_object"},
                 temperature=0.2,
                 max_tokens=600,

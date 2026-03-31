@@ -3,6 +3,7 @@ import re
 from app.agents.base import AgentBase
 from app.agents.llm_client import is_llm_available, timed_chat_completion, truncate_text
 from app.core.config import settings
+from app.routing.model_config import AGENT_MODELS
 
 
 TRANSITION_WORDS = {
@@ -161,6 +162,16 @@ class ReviewerAgent(AgentBase):
             grounding_score = 0.65
         grounding_score = min(1.0, grounding_score)
 
+        generic_hits = [phrase for phrase in GENERIC_PHRASES if phrase in normalized]
+        digit_count = sum(1 for ch in content if ch.isdigit())
+        evidence_terms = {
+            token.lower()
+            for item in evidence_pack[:8]
+            for token in re.findall(r"\b[a-zA-Z][a-zA-Z0-9\-]{3,}\b", item.get("title", "") + " " + item.get("abstract", ""))
+        }
+        content_tokens = set(re.findall(r"\b[a-zA-Z][a-zA-Z0-9\-]{3,}\b", normalized))
+        domain_hits = content_tokens & evidence_terms
+
         analysis_score = 0.35
         if any(word in normalized for word in LIMITATION_MARKERS):
             analysis_score += 0.25
@@ -169,7 +180,7 @@ class ReviewerAgent(AgentBase):
             suggestions.append("Add at least one limitation, uncertainty, or counterpoint.")
         if any(token in normalized for token in ["because", "therefore", "suggests", "indicates", "implies"]):
             analysis_score += 0.25
-        if any(char.isdigit() for char in content):
+        if digit_count > 0:
             analysis_score += 0.15
         analysis_score += 0.25 * min(1.0, sentence_count / 8)
         analysis_score = min(1.0, analysis_score)
@@ -179,7 +190,7 @@ class ReviewerAgent(AgentBase):
             clarity_score += 0.25
         else:
             suggestions.append("Reduce repetitive phrasing and vary sentence construction.")
-        if not any(phrase in normalized for phrase in GENERIC_PHRASES):
+        if not generic_hits:
             clarity_score += 0.2
         else:
             suggestions.append("Replace generic academic boilerplate with more specific argumentation.")
@@ -236,7 +247,7 @@ class ReviewerAgent(AgentBase):
             "revision_attempt": revision_attempt,
             "approved": approved,
             "metrics": {
-                "repeated_phrase_ratio": round(repeated_ratio, 3),
+                "repeated_phrase_ratio": round(repetition_ratio, 3),
                 "citation_count": citation_count,
                 "generic_phrase_count": len(generic_hits),
                 "quantitative_signal_count": digit_count,
@@ -287,6 +298,7 @@ class ReviewerAgent(AgentBase):
                 db=db,
                 agent_name=self.name,
                 log_api_call_fn=self._log_api_call,
+                model=AGENT_MODELS["reviewer"]["default"],
                 response_format={"type": "json_object"},
                 temperature=0.15,
                 max_tokens=700,

@@ -13,6 +13,7 @@ from app.agents.web_search import WebSearchAgent
 AGENT_REGISTRY = {
     "planner": PlannerAgent,
     "research": ResearchAgent,
+    "thesis": ThesisAgent,
     "web_search": WebSearchAgent,
     "verification": VerificationAgent,
     "writer": WriterAgent,
