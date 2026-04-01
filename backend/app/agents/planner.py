@@ -2,6 +2,7 @@ import json
 from app.agents.base import AgentBase
 from app.agents.llm_client import is_llm_available, timed_chat_completion
 from app.core.config import settings
+from app.routing.model_config import AGENT_MODELS
 
 
 SECTION_TEMPLATES = [
@@ -317,6 +318,7 @@ class PlannerAgent(AgentBase):
                 db=db,
                 agent_name=self.name,
                 log_api_call_fn=self._log_api_call,
+                model=AGENT_MODELS["planner"]["default"],
                 response_format={"type": "json_object"},
             )
             return self._normalize_plan(json.loads(content), word_count_target=word_count_target)

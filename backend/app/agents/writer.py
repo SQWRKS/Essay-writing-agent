@@ -5,6 +5,7 @@ from collections import Counter
 from app.agents.base import AgentBase
 from app.agents.llm_client import is_llm_available, timed_chat_completion, truncate_text, quality_max_tokens
 from app.core.config import settings
+from app.routing.model_config import AGENT_MODELS, WRITER_REFINE_SECTIONS
 
 
 SECTION_TEMPLATES = {
@@ -198,15 +199,8 @@ class WriterAgent(AgentBase):
                 f"{query_line}."
             )
 
-        prompt = self.build_prompt(payload, stricter_feedback)
-        return await timed_chat_completion(
-            prompt,
-            db=db,
-            agent_name=self.name,
-            log_api_call_fn=self._log_api_call,
-            temperature=0.25 if attempt == 0 else 0.15,
-            max_tokens=min(1600, max(900, payload["word_count"] * 3)),
-        )
+        content = "\n\n".join(content_parts)
+        return {"section": section, "content": content, "word_count": len(content.split())}
 
     def build_prompt(self, payload: dict, stricter_feedback: str = "") -> str:
         section_goal = SECTION_GUIDANCE.get(payload["section"], "advance the thesis with technical, evidence-based analysis")
@@ -263,6 +257,16 @@ class WriterAgent(AgentBase):
         db,
         writing_style: str = "",
     ) -> dict:
+        """Write a section using cost-optimised model routing.
+
+        Draft strategy:
+        - All sections are first drafted with the cheap model (deepseek-chat).
+        - Sections in ``WRITER_REFINE_SECTIONS`` (introduction, conclusion) are
+          then refined using the expensive model (claude-3.5-sonnet) to ensure
+          the highest-quality prose for the most reader-visible parts of the
+          essay.
+        - All other sections keep the cheap draft as the final output.
+        """
         try:
             section_plan = section_plan or {}
             # Token-efficient evidence selection: top 3 items are enough for grounding
@@ -302,14 +306,38 @@ class WriterAgent(AgentBase):
                 "7) Use '## Subheading' markdown only when it improves clarity (max 2).\n"
                 "Return only the final section prose."
             )
+
+            # Step 1: Draft with cheap model
             content = await timed_chat_completion(
                 prompt,
                 db=db,
                 agent_name=self.name,
                 log_api_call_fn=self._log_api_call,
+                model=AGENT_MODELS["writer"]["draft"],
                 temperature=0.45,
                 max_tokens=quality_max_tokens(),
             )
+
+            # Step 2: Refine with expensive model for high-impact sections only
+            if section in WRITER_REFINE_SECTIONS:
+                refine_prompt = (
+                    f"You are refining the '{section}' section of an academic essay on '{topic}'.\n\n"
+                    "Improve the prose quality, argumentative clarity, and elegance of the draft below. "
+                    "Preserve all factual claims, citations, and structure. "
+                    "Focus on the opening argument and closing synthesis.\n\n"
+                    f"DRAFT:\n{content}\n\n"
+                    "Return only the refined section prose."
+                )
+                content = await timed_chat_completion(
+                    refine_prompt,
+                    db=db,
+                    agent_name=self.name,
+                    log_api_call_fn=self._log_api_call,
+                    model=AGENT_MODELS["writer"]["refine"],
+                    temperature=0.3,
+                    max_tokens=quality_max_tokens(),
+                )
+
             return {
                 "section": section,
                 "content": content,

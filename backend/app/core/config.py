@@ -30,6 +30,14 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str = ""
     ANTHROPIC_MODEL: str = "claude-opus-4-6"
 
+    # DeepSeek settings (OpenAI-compatible API)
+    DEEPSEEK_API_KEY: str = ""
+    DEEPSEEK_BASE_URL: str = "https://api.deepseek.com/v1"
+
+    # Mistral settings (OpenAI-compatible API)
+    MISTRAL_API_KEY: str = ""
+    MISTRAL_BASE_URL: str = "https://api.mistral.ai/v1"
+
     # Shared LLM settings
     QUALITY_MODE: str = "quality"
     LLM_TEMPERATURE: float = 0.7

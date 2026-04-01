@@ -4,6 +4,7 @@ import re
 from app.agents.base import AgentBase
 from app.agents.llm_client import is_llm_available, timed_chat_completion, truncate_text
 from app.core.config import settings
+from app.routing.model_config import AGENT_MODELS
 
 
 class CoherenceAgent(AgentBase):
@@ -157,6 +158,10 @@ class CoherenceAgent(AgentBase):
         The LLM result is merged with the heuristic result: the LLM score takes
         priority but heuristic structural flags (repeated openings, weak sections)
         are preserved so that the pipeline can still act on them.
+
+        Uses cost-optimised routing: starts with the cheap model (mistral-small)
+        and escalates to the expensive model (gpt-5) when the router determines
+        that structural restructuring is required.
         """
         try:
             # Build a compact section digest: first 300 chars of each section
@@ -175,11 +180,12 @@ class CoherenceAgent(AgentBase):
                 "  issues (array of strings), suggestions (array of strings).\n\n"
                 f"Section openings:\n{json.dumps(section_digest)}"
             )
-            response_text = await timed_chat_completion(
+            response_text, _ = await self._call_with_routing(
+                "essay coherence review",
+                AGENT_MODELS["coherence"]["cheap"],
+                AGENT_MODELS["coherence"]["expensive"],
                 prompt,
-                db=db,
-                agent_name=self.name,
-                log_api_call_fn=self._log_api_call,
+                db,
                 response_format={"type": "json_object"},
                 temperature=0.2,
                 max_tokens=512,

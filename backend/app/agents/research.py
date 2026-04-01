@@ -8,6 +8,7 @@ import httpx
 from app.agents.base import AgentBase
 from app.agents.llm_client import is_llm_available, timed_chat_completion, truncate_text
 from app.core.config import settings
+from app.routing.model_config import AGENT_MODELS
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,7 @@ class ResearchAgent(AgentBase):
         sources_list = input_data.get("sources", settings.RESEARCH_SOURCES)
         min_sources = max(10, min(int(input_data.get("min_sources", 14)), 20))
 
+        queries = list(seed_queries)
         if not queries and topic:
             queries = [f"{topic} overview", f"{topic} methods"]
 
@@ -85,17 +87,17 @@ class ResearchAgent(AgentBase):
         all_sources = []
         for source_name in sources_list:
             if source_name == "arxiv":
-                srcs = await self._search_arxiv(expanded_queries[:5], project_id, db)
+                srcs = await self._search_arxiv(queries[:5], project_id, db)
             elif source_name == "semantic_scholar":
-                srcs = await self._search_semantic_scholar(expanded_queries[:5], project_id, db)
+                srcs = await self._search_semantic_scholar(queries[:5], project_id, db)
             elif source_name == "web":
-                srcs = await self._search_crossref(expanded_queries[:5], project_id, db)
+                srcs = await self._search_crossref(queries[:5], project_id, db)
             else:
-                srcs = self._mock_sources(source_name, expanded_queries)
+                srcs = self._mock_sources(source_name, queries)
             all_sources.extend(srcs)
 
         unique_sources = self._deduplicate_sources(all_sources)
-        ranked_sources = self._rank_sources(unique_sources, topic, expanded_queries)[:max(min_sources, 18)]
+        ranked_sources = self._rank_sources(unique_sources, topic, queries)[:max(min_sources, 18)]
         structured_summaries = self._build_structured_summaries(ranked_sources, topic)
         summary = ""
         if structured_summaries:
@@ -109,7 +111,7 @@ class ResearchAgent(AgentBase):
             source_breakdown[src_name] = source_breakdown.get(src_name, 0) + 1
 
         result = {
-            "queries": expanded_queries,
+            "queries": queries,
             "sources": ranked_sources,
             "summaries": structured_summaries,
             "total_found": len(ranked_sources),
@@ -199,6 +201,87 @@ class ResearchAgent(AgentBase):
         ranked.sort(key=lambda item: item.get("relevance_score", 0.0), reverse=True)
         return ranked
 
+    def _expand_queries(self, topic: str, queries: list[str]) -> list[str]:
+        """Merge LLM-generated queries with topic-anchored fallback queries.
+
+        Ensures the query list always contains at least a few topic-specific
+        entries even when the LLM returns fewer queries than expected.
+        """
+        fallback = [
+            f"{topic} overview",
+            f"{topic} methods",
+            f"recent advances in {topic}",
+        ]
+        combined = list(dict.fromkeys(queries + fallback))
+        return combined
+
+    def _deduplicate_sources(self, sources: list[dict]) -> list[dict]:
+        """Remove duplicate sources based on DOI (preferred) then normalised title."""
+        seen_dois: set[str] = set()
+        seen_titles: set[str] = set()
+        unique: list[dict] = []
+        for src in sources:
+            doi = (src.get("doi") or "").strip()
+            title_key = re.sub(r"\s+", " ", (src.get("title") or "").strip().lower())
+            if doi and doi in seen_dois:
+                continue
+            if title_key and title_key in seen_titles:
+                continue
+            if doi:
+                seen_dois.add(doi)
+            if title_key:
+                seen_titles.add(title_key)
+            unique.append(src)
+        return unique
+
+    def _build_structured_summaries(self, sources: list[dict], topic: str) -> list[dict]:
+        """Build a list of structured summary dicts from ranked source records.
+
+        Each summary exposes a normalised set of fields used by downstream
+        agents (ThesisAgent, WriterAgent) for evidence grounding.
+        """
+        summaries: list[dict] = []
+        for src in sources:
+            abstract = (src.get("abstract") or "").strip()
+            title = (src.get("title") or "").strip()
+            key_findings = abstract[:300] if abstract else f"Research related to {topic}."
+            summaries.append(
+                {
+                    "source": {
+                        "title": title,
+                        "authors": src.get("authors") or [],
+                        "year": src.get("year"),
+                        "doi": src.get("doi") or "",
+                        "url": src.get("url") or "",
+                        "venue": src.get("venue") or "",
+                    },
+                    "key_findings": key_findings,
+                    "abstract_excerpt": abstract[:200],
+                    "relevance_score": src.get("relevance_score", 0.0),
+                    "quantitative_data": [],
+                    "section_relevance": {},
+                }
+            )
+        return summaries
+
+    def _compose_summary(self, structured_summaries: list[dict], topic: str) -> str:
+        """Build a plain-text research summary without an LLM call.
+
+        Used as a fallback when the LLM summarisation step fails or is
+        skipped.  Concatenates key findings from the top sources.
+        """
+        if not structured_summaries:
+            return f"Research on {topic} encompasses several important dimensions."
+        lines: list[str] = []
+        for i, summary in enumerate(structured_summaries[:6], 1):
+            src = summary.get("source", {})
+            title = src.get("title", "Unknown source")
+            year = src.get("year", "n.d.")
+            finding = summary.get("key_findings", "")
+            if finding:
+                lines.append(f"[{i}] {title} ({year}): {finding[:180]}")
+        return " ".join(lines) if lines else f"Several studies address {topic}."
+
     async def _llm_refine_queries(self, queries: list, topic: str, project_id: str, db) -> list:
         """Use LLM to generate focused academic search queries from the input list."""
         try:
@@ -215,6 +298,7 @@ class ResearchAgent(AgentBase):
                 db=db,
                 agent_name=self.name,
                 log_api_call_fn=self._log_api_call,
+                model=AGENT_MODELS["research"]["cheap"],
                 response_format={"type": "json_object"},
                 temperature=0.2,
                 max_tokens=512,
@@ -229,7 +313,13 @@ class ResearchAgent(AgentBase):
         return queries[:10]
 
     async def _llm_summarize(self, sources: list, topic: str, project_id: str, db) -> str:
-        """Use LLM to synthesize a structured research summary from gathered sources."""
+        """Use LLM to synthesize a structured research summary from gathered sources.
+
+        Uses the cheap model (deepseek-chat) by default.  When the router
+        determines that the synthesis requires deeper reasoning (e.g. multiple
+        conflicting sources), the task is escalated to the expensive model
+        (gpt-5).
+        """
         if not sources:
             return ""
         try:
@@ -250,15 +340,17 @@ class ResearchAgent(AgentBase):
                 "Using only the structured summaries provided, write a dense 5-7 sentence literature synthesis. "
                 "State the dominant technical themes, include concrete named examples, mention quantitative evidence when available, and identify at least one unresolved limitation or disagreement. "
                 "Use inline citation markers like [1], [2], [3] that match the source order. Return only the synthesis.\n\n"
-                f"Structured summaries:\n{json.dumps(summaries[:8])}"
+                f"Structured summaries:\n{json.dumps(sources[:6])}"
             )
-            return await timed_chat_completion(
+            output, _ = await self._call_with_routing(
+                "literature summarisation",
+                AGENT_MODELS["research"]["cheap"],
+                AGENT_MODELS["research"]["expensive"],
                 prompt,
-                db=db,
-                agent_name=self.name,
-                log_api_call_fn=self._log_api_call,
+                db,
                 max_tokens=600,
             )
+            return output
         except Exception:
             return ""
 
