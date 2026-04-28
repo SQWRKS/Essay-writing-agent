@@ -62,21 +62,61 @@ class ThesisAgent(AgentBase):
             return cleaned[0][0].lower() + cleaned[0][1:]
         return "; ".join(claim[0].lower() + claim[1:] for claim in cleaned[:2])
 
+    def _thesis_is_weak(self, result: dict) -> bool:
+        """Heuristic check: is the thesis too short, generic, or vague?"""
+        thesis = (result.get("thesis") or "").strip()
+        claims = result.get("supporting_claims") or []
+        if len(thesis) < 60:
+            return True
+        if not claims:
+            return True
+        generic_phrases = (
+            "evidence suggests", "is important", "has been studied",
+            "researchers have", "plays a role", "is a key",
+        )
+        lower = thesis.lower()
+        if sum(1 for p in generic_phrases if p in lower) >= 2:
+            return True
+        return False
+
     async def _llm_generate(self, topic: str, summaries: list[dict], project_id: str, db) -> dict:
+        """Generate thesis with cheap model, escalate to expensive if output is weak."""
+        prompt = (
+            f"You are formulating the core thesis for a final-year academic paper on '{topic}'. "
+            "Using only the structured research summaries, return JSON with keys 'thesis' and 'supporting_claims'. "
+            "The thesis must be arguable, precise, technically grounded, and defensible with the evidence. "
+            "Avoid generic framing. Supporting claims must be short bullet-style statements extracted from the evidence.\n\n"
+            f"Structured research summaries:\n{json.dumps(summaries[:8])}"
+        )
+        # --- cheap pass ---
         try:
-            prompt = (
-                f"You are formulating the core thesis for a final-year academic paper on '{topic}'. "
-                "Using only the structured research summaries, return JSON with keys 'thesis' and 'supporting_claims'. "
-                "The thesis must be arguable, precise, technically grounded, and defensible with the evidence. "
-                "Avoid generic framing. Supporting claims must be short bullet-style statements extracted from the evidence.\n\n"
-                f"Structured research summaries:\n{json.dumps(summaries[:8])}"
-            )
             response = await timed_chat_completion(
                 prompt,
                 db=db,
                 agent_name=self.name,
                 log_api_call_fn=self._log_api_call,
-                model=AGENT_MODELS["thesis"]["default"],
+                model=AGENT_MODELS["thesis"]["cheap"],
+                response_format={"type": "json_object"},
+                temperature=0.2,
+                max_tokens=600,
+            )
+            payload = json.loads(response)
+            if isinstance(payload, dict) and payload.get("thesis"):
+                payload.setdefault("supporting_claims", [])
+                if not self._thesis_is_weak(payload):
+                    return payload
+                # Weak output — fall through to expensive model
+        except Exception:
+            pass
+
+        # --- expensive escalation ---
+        try:
+            response = await timed_chat_completion(
+                prompt,
+                db=db,
+                agent_name=self.name,
+                log_api_call_fn=self._log_api_call,
+                model=AGENT_MODELS["thesis"]["expensive"],
                 response_format={"type": "json_object"},
                 temperature=0.2,
                 max_tokens=600,
@@ -87,4 +127,5 @@ class ThesisAgent(AgentBase):
                 return payload
         except Exception:
             pass
+
         return self._heuristic_generate(topic, summaries)

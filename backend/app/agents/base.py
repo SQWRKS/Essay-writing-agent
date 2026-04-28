@@ -112,7 +112,7 @@ class AgentBase(ABC):
             metadata_json=json.dumps(metadata) if metadata else None,
         )
         db.add(log)
-        await db.commit()
+        await db.flush()
 
     async def _update_agent_state(
         self, db: AsyncSession, project_id: str, status: str, output: dict | None = None

@@ -1,8 +1,13 @@
+import json
+import logging
 import re
 
 from app.agents.base import AgentBase
+from app.agents.llm_client import is_llm_available, timed_chat_completion
 from app.core.config import settings
+from app.routing.model_config import AGENT_MODELS
 
+logger = logging.getLogger(__name__)
 
 CLAIM_HINTS = {
     "shows", "suggests", "demonstrates", "indicates", "improves", "increases",
@@ -113,6 +118,75 @@ class GroundingAgent(AgentBase):
             "revision_attempt": revision_attempt,
         }
 
+    async def _llm_ground(
+        self,
+        content: str,
+        evidence_pack: list[dict],
+        heuristic: dict,
+        project_id: str,
+        db,
+    ) -> dict:
+        """LLM grounding pass: validate claim→evidence alignment and merge scores.
+
+        Falls back to *heuristic* if the LLM is unavailable or returns malformed
+        output.
+        """
+        try:
+            evidence_summary = [
+                {
+                    "title": e.get("title", ""),
+                    "excerpt": (e.get("abstract_excerpt") or "")[:200],
+                }
+                for e in evidence_pack[:6]
+            ]
+            prompt = (
+                "You are a fact-grounding evaluator for academic writing.\n\n"
+                "Evaluate the section content below against the evidence pack. "
+                "Return JSON with keys:\n"
+                "  score (0.0–1.0), approved (bool), issues (list of strings), "
+                "suggestions (list of strings), unsupported_claim_count (int).\n\n"
+                f"Evidence pack:\n{json.dumps(evidence_summary)}\n\n"
+                f"Section content (first 1200 chars):\n{content[:1200]}"
+            )
+            response = await timed_chat_completion(
+                prompt,
+                db=db,
+                agent_name=self.name,
+                log_api_call_fn=self._log_api_call,
+                model=AGENT_MODELS["grounding"]["default"],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+                max_tokens=400,
+            )
+            payload = json.loads(response)
+            if not isinstance(payload, dict) or "score" not in payload:
+                return heuristic
+
+            llm_score = float(payload.get("score", heuristic["score"]))
+            # Blend: 60 % heuristic (rule-based precision) + 40 % LLM
+            blended_score = round(0.6 * heuristic["score"] + 0.4 * llm_score, 3)
+            merged = {
+                **heuristic,
+                "score": blended_score,
+                "approved": blended_score >= settings.GROUNDING_MIN_SCORE
+                    and heuristic.get("unsupported_claim_count", 0) == 0,
+                "issues": list(dict.fromkeys(
+                    heuristic.get("issues", []) + (payload.get("issues") or [])
+                ))[:6],
+                "suggestions": list(dict.fromkeys(
+                    heuristic.get("suggestions", []) + (payload.get("suggestions") or [])
+                ))[:6],
+            }
+            if "unsupported_claim_count" in payload:
+                merged["unsupported_claim_count"] = max(
+                    heuristic.get("unsupported_claim_count", 0),
+                    int(payload["unsupported_claim_count"]),
+                )
+            return merged
+        except Exception as exc:
+            logger.debug("GroundingAgent LLM pass failed (non-fatal): %s", exc)
+            return heuristic
+
     async def execute(self, input_data: dict, project_id: str, db) -> dict:
         await self._update_agent_state(db, project_id, "running")
         content = input_data.get("content", "")
@@ -120,5 +194,9 @@ class GroundingAgent(AgentBase):
         revision_attempt = int(input_data.get("revision_attempt", 0))
 
         result = self._heuristic_grounding(content, evidence_pack, revision_attempt)
+
+        if is_llm_available() and evidence_pack:
+            result = await self._llm_ground(content, evidence_pack, result, project_id, db)
+
         await self._update_agent_state(db, project_id, "completed", result)
         return result

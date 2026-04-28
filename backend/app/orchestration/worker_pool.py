@@ -106,6 +106,7 @@ class WorkerPool:
         """
         from app.models import Project, Task
         from app.agents import AGENT_REGISTRY
+        from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AsyncSession
 
         # ---- Unpack fine-tune settings (all optional, all have safe defaults) ----
         ps: dict = project_settings or {}
@@ -113,6 +114,18 @@ class WorkerPool:
         ft_writing_style: str = (ps.get("writing_style") or "").strip()
         ft_context_text: str = (ps.get("context_text") or "").strip()
         ft_rubric: str = (ps.get("rubric") or "").strip()
+
+        # Derive a session factory from the same engine as the caller's session.
+        # This ensures tests using an in-memory engine are transparently compatible
+        # with the parallel section processing that opens fresh sessions.
+        try:
+            _bind = db.bind  # AsyncEngine from the same pool as the current session
+            self._section_session_factory = async_sessionmaker(
+                _bind, class_=_AsyncSession, expire_on_commit=False
+            )
+        except Exception:
+            from app.database import AsyncSessionLocal
+            self._section_session_factory = AsyncSessionLocal
 
         # Update project status
         result = await db.execute(select(Project).where(Project.id == project_id))
@@ -287,223 +300,45 @@ class WorkerPool:
             thesis_statement = thesis_result.get("thesis", "")
             content["metadata"]["thesis"] = thesis_statement
 
-            # --- WRITER + REVIEWER per section ---
+            # --- WRITER + REVIEWER per section (parallel) ---
             sections = plan.get("sections", [])
             sections = [section for section in sections if section.get("include", True)]
             if not sections:
                 sections = [{"key": "introduction", "title": "Introduction", "word_count_target": 500}]
             sections_by_key = {item.get("key", "introduction"): item for item in sections}
 
-            writer_task_ids = []
-            section_quality_entries = []
-            for section_info in sections:
-                sec_key = section_info.get("key", "introduction")
-                section_evidence = self._build_section_evidence(section_info, verified_sources)
-                evidence_count = len(section_evidence)
-                section_word_target = int(section_info.get("word_count_target", 500) or 500)
-                section_max_attempts = int(settings.MAX_REVISION_ATTEMPTS)
+            section_target_score = max(settings.REVIEW_MIN_SCORE, settings.SECTION_SCORE_TARGET)
 
-                # Results sections can burn tokens when evidence is weak; cap retries and target length.
-                if sec_key == "results" and evidence_count < 3:
-                    section_max_attempts = min(section_max_attempts, 1)
-                    section_word_target = min(section_word_target, 450)
+            # Run all sections concurrently, each in its own fresh DB session.
+            section_coros = [
+                self._process_section_in_fresh_session(
+                    section_info=section_info,
+                    topic=topic,
+                    thesis_statement=thesis_statement,
+                    verified_sources=verified_sources,
+                    research_result=research_result,
+                    project_id=project_id,
+                    ft_writing_style=ft_writing_style,
+                    ft_rubric=ft_rubric,
+                    dep_task_id=verify_task.id,
+                    section_target_score=section_target_score,
+                )
+                for section_info in sections
+            ]
+            section_outcomes = await asyncio.gather(*section_coros, return_exceptions=True)
 
-                writer_input = {
-                    "section": sec_key,
-                    "topic": topic,
-                    "word_count": section_word_target,
-                    "section_plan": section_info,
-                    "research_data": {
-                        "sources": verified_sources,
-                        "summaries": research_result.get("summaries", []),
-                        "thesis": thesis_statement,
-                        "section_queries": section_info.get("research_queries", []),
-                        "evidence_pack": section_evidence,
-                        "research_summary": research_result.get("summary", ""),
-                    },
-                }
-                # Inject optional fine-tune settings (no-op when empty)
-                if ft_writing_style:
-                    writer_input["writing_style"] = ft_writing_style
-                writer_task = await self._create_task(db, project_id, "writer", writer_input, [verify_task.id])
-                graph.add_task(writer_task.id, "writer", [verify_task.id])
-                await db.commit()
-                writer_task_ids.append(writer_task.id)
-
-                write_result = await self._run_task(writer_task, db, project_id, writer_input)
-                graph.mark_completed(writer_task.id)
-                written_content = write_result.get("content", "")
-                revision_attempts_used = 0
-                section_target_score = max(settings.REVIEW_MIN_SCORE, settings.SECTION_SCORE_TARGET)
-                section_started_at = time.monotonic()
-                stop_reason = "initial_review"
-
-                grounding_input = {
-                    "section": sec_key,
-                    "content": written_content,
-                    "evidence_pack": section_evidence,
-                    "revision_attempt": revision_attempts_used,
-                }
-                grounding_task = await self._create_task(db, project_id, "grounding", grounding_input, [writer_task.id])
-                graph.add_task(grounding_task.id, "grounding", [writer_task.id])
-                await db.commit()
-                grounding_result = await self._run_task(grounding_task, db, project_id, grounding_input)
-                graph.mark_completed(grounding_task.id)
-
-                # Reviewer
-                review_input = {
-                    "section": sec_key,
-                    "content": written_content,
-                    "expected_word_count": section_info.get("word_count_target", 500),
-                    "evidence_pack": section_evidence,
-                    "grounding_summary": grounding_result,
-                    "revision_attempt": revision_attempts_used,
-                }
-                if ft_rubric:
-                    review_input["rubric"] = ft_rubric
-                reviewer_task = await self._create_task(db, project_id, "reviewer", review_input, [writer_task.id])
-                graph.add_task(reviewer_task.id, "reviewer", [writer_task.id])
-                await db.commit()
-
-                review_result = await self._run_task(reviewer_task, db, project_id, review_input)
-                graph.mark_completed(reviewer_task.id)
-
-                current_score = float(review_result.get("score", 0.0))
-                approved = bool(review_result.get("approved", False)) and current_score >= section_target_score
-                if approved:
-                    stop_reason = "target_score_reached"
-                best_snapshot = {
-                    "content": written_content,
-                    "review": review_result,
-                    "grounding": grounding_result,
-                    "score": current_score,
-                    "subheadings": write_result.get("subheadings", []),
-                }
-                plateau_rounds = 0
-                low_grounding_rounds = 1 if float(grounding_result.get("score", 0.0)) < 0.55 else 0
-
-                while not approved:
-                    if revision_attempts_used >= section_max_attempts:
-                        stop_reason = "max_revision_attempts"
-                        break
-
-                    elapsed_minutes = (time.monotonic() - section_started_at) / 60.0
-                    if elapsed_minutes >= settings.MAX_SECTION_REVISION_MINUTES:
-                        stop_reason = "max_revision_minutes"
-                        break
-
-                    revision_attempts_used += 1
-                    structured_feedback = self._build_revision_feedback(review_result, grounding_result, revision_attempts_used)
-                    revised_input = {
-                        **writer_input,
-                        "revision_attempt": revision_attempts_used,
-                        "feedback": json.dumps(structured_feedback),
-                    }
-                    writer_task2 = await self._create_task(db, project_id, "writer", revised_input, [reviewer_task.id])
-                    graph.add_task(writer_task2.id, "writer", [reviewer_task.id])
-                    await db.commit()
-                    writer_task_ids.append(writer_task2.id)
-                    write_result = await self._run_task(writer_task2, db, project_id, revised_input)
-                    graph.mark_completed(writer_task2.id)
-                    revised_content = write_result.get("content", written_content)
-
-                    reground_input = {
-                        "section": sec_key,
-                        "content": revised_content,
-                        "evidence_pack": section_evidence,
-                        "revision_attempt": revision_attempts_used,
-                    }
-                    reground_task = await self._create_task(db, project_id, "grounding", reground_input, [writer_task2.id])
-                    graph.add_task(reground_task.id, "grounding", [writer_task2.id])
-                    await db.commit()
-                    reground_result = await self._run_task(reground_task, db, project_id, reground_input)
-                    graph.mark_completed(reground_task.id)
-
-                    re_review_input = {
-                        "section": sec_key,
-                        "content": revised_content,
-                        "expected_word_count": section_info.get("word_count_target", 500),
-                        "evidence_pack": section_evidence,
-                        "grounding_summary": reground_result,
-                        "revision_attempt": revision_attempts_used,
-                    }
-                    if ft_rubric:
-                        re_review_input["rubric"] = ft_rubric
-                    re_review_task = await self._create_task(db, project_id, "reviewer", re_review_input, [writer_task2.id])
-                    graph.add_task(re_review_task.id, "reviewer", [writer_task2.id])
-                    await db.commit()
-                    re_review_result = await self._run_task(re_review_task, db, project_id, re_review_input)
-                    graph.mark_completed(re_review_task.id)
-
-                    new_score = float(re_review_result.get("score", 0.0))
-                    score_delta = new_score - current_score
-
-                    written_content = revised_content
-                    review_result = re_review_result
-                    grounding_result = reground_result
-                    current_score = new_score
-
-                    if new_score > best_snapshot["score"]:
-                        best_snapshot = {
-                            "content": revised_content,
-                            "review": re_review_result,
-                            "grounding": reground_result,
-                            "score": new_score,
-                            "subheadings": write_result.get("subheadings", []),
-                        }
-
-                    if score_delta < settings.MIN_REVISION_DELTA:
-                        plateau_rounds += 1
-                    else:
-                        plateau_rounds = 0
-
-                    if float(reground_result.get("score", 0.0)) < 0.55:
-                        low_grounding_rounds += 1
-                    else:
-                        low_grounding_rounds = 0
-
-                    approved = bool(re_review_result.get("approved", False)) and new_score >= section_target_score
-                    if approved:
-                        stop_reason = "target_score_reached"
-                        break
-                    if plateau_rounds >= 2:
-                        stop_reason = "score_plateau"
-                        break
-                    if low_grounding_rounds >= 2:
-                        stop_reason = "grounding_persistent_low"
-                        break
-
-                if not approved and stop_reason == "initial_review":
-                    stop_reason = "review_not_approved"
-
-                written_content = best_snapshot["content"]
-                review_result = best_snapshot["review"]
-                grounding_result = best_snapshot["grounding"]
-
-                content["sections"][sec_key] = written_content
-                content["metadata"].setdefault("subheadings", {})[sec_key] = best_snapshot.get("subheadings", [])
-                section_quality = {
-                    "title": section_info.get("title", sec_key.title()),
-                    "score": review_result.get("score", 0.0),
-                    "approved": bool(review_result.get("approved", False)) and float(review_result.get("score", 0.0)) >= section_target_score,
-                    "target_score": section_target_score,
-                    "stop_reason": stop_reason,
-                    "revision_attempts": revision_attempts_used,
-                    "expected_word_count": section_word_target,
-                    "evidence_count": evidence_count,
-                    "actual_word_count": len(written_content.split()),
-                    "citation_count": review_result.get("citation_count", 0),
-                    "grounding_score": grounding_result.get("score", 0.0),
-                    "grounding_issues": grounding_result.get("issues", []),
-                    "unsupported_claim_count": grounding_result.get("unsupported_claim_count", 0),
-                    "category_scores": review_result.get("category_scores", {}),
-                    "blocking_issues": review_result.get("blocking_issues", []),
-                    "feedback": review_result.get("feedback", ""),
-                    "suggestions": review_result.get("suggestions", []),
-                    "strengths": review_result.get("strengths", []),
-                }
-                content["metadata"]["quality"]["sections"][sec_key] = section_quality
-                section_quality_entries.append(section_quality)
+            writer_task_ids: list[str] = []
+            section_quality_entries: list[dict] = []
+            for outcome in section_outcomes:
+                if isinstance(outcome, BaseException):
+                    logger.warning("Section processing failed (non-fatal): %s", outcome)
+                    continue
+                sec_key = outcome["sec_key"]
+                content["sections"][sec_key] = outcome["written_content"]
+                content["metadata"].setdefault("subheadings", {})[sec_key] = outcome["subheadings"]
+                content["metadata"]["quality"]["sections"][sec_key] = outcome["section_quality"]
+                section_quality_entries.append(outcome["section_quality"])
+                writer_task_ids.extend(outcome["writer_task_ids"])
 
             if section_quality_entries:
                 approved_count = sum(1 for item in section_quality_entries if item.get("approved"))
@@ -674,6 +509,13 @@ class WorkerPool:
                 coherence_task = next_coherence_task
                 coherence_approved = bool(coherence_result.get("approved", False)) and coherence_score >= coherence_target
 
+                await sse_manager.publish(project_id, "coherence_round_complete", {
+                    "project_id": project_id,
+                    "round": coherence_round,
+                    "score": coherence_score,
+                    "approved": coherence_approved,
+                })
+
                 if coherence_approved:
                     coherence_stop_reason = "target_score_reached"
                     break
@@ -708,6 +550,32 @@ class WorkerPool:
                 content["metadata"]["nlp_analysis"] = nlp_analysis
             except Exception as _nlp_err:
                 logger.warning("NLP essay analysis failed (non-fatal): %s", _nlp_err)
+
+            # --- PLAGIARISM ---
+            try:
+                plagiarism_input = {
+                    "sections": content["sections"],
+                    "sources": verified_sources,
+                }
+                plagiarism_task = await self._create_task(db, project_id, "plagiarism", plagiarism_input, [*writer_task_ids, coherence_task.id])
+                graph.add_task(plagiarism_task.id, "plagiarism", [*writer_task_ids, coherence_task.id])
+                await db.commit()
+                plagiarism_result = await self._run_task(plagiarism_task, db, project_id, plagiarism_input)
+                graph.mark_completed(plagiarism_task.id)
+                content["metadata"]["plagiarism"] = plagiarism_result
+
+                # Surface high-severity warnings in the quality summary
+                warnings = plagiarism_result.get("warnings") or plagiarism_result.get("issues") or []
+                if warnings:
+                    content["metadata"]["quality"]["summary"]["plagiarism_warnings"] = warnings[:5]
+
+                await sse_manager.publish(project_id, "plagiarism_complete", {
+                    "project_id": project_id,
+                    "score": plagiarism_result.get("score", 1.0),
+                    "warning_count": len(warnings),
+                })
+            except Exception as _plag_err:
+                logger.warning("PlagiarismAgent failed (non-fatal): %s", _plag_err)
 
             # --- CITATION ---
             citation_input = {"sources": verified_sources, "style": "harvard"}
@@ -751,6 +619,8 @@ class WorkerPool:
                 project.content = json.dumps(content)
                 project.status = "completed"
                 project.updated_at = datetime.now(timezone.utc)
+            # Single commit here persists project content, status, and all
+            # pending log entries that were flush()ed but not yet committed.
             await db.commit()
 
             await sse_manager.publish(project_id, "pipeline_complete", {"project_id": project_id, "status": "completed"})
@@ -828,6 +698,264 @@ class WorkerPool:
             )
         return evidence
 
+    async def _process_section_in_fresh_session(
+        self,
+        section_info: dict,
+        topic: str,
+        thesis_statement: str,
+        verified_sources: list[dict],
+        research_result: dict,
+        project_id: str,
+        ft_writing_style: str,
+        ft_rubric: str,
+        dep_task_id: str,
+        section_target_score: float,
+    ) -> dict:
+        """Write, ground, and review one section in its own DB session.
+
+        All task records are created and updated within the fresh session so
+        the method can run concurrently with other sections without sharing
+        SQLAlchemy session state.
+
+        Returns a dict with:
+          sec_key, written_content, section_quality, subheadings, writer_task_ids.
+        """
+        from app.database import AsyncSessionLocal
+
+        session_factory = getattr(self, "_section_session_factory", None) or AsyncSessionLocal
+
+        sec_key = section_info.get("key", "introduction")
+        section_evidence = self._build_section_evidence(section_info, verified_sources)
+        evidence_count = len(section_evidence)
+        section_word_target = int(section_info.get("word_count_target", 500) or 500)
+        section_max_attempts = int(settings.MAX_REVISION_ATTEMPTS)
+
+        if sec_key == "results" and evidence_count < 3:
+            section_max_attempts = min(section_max_attempts, 1)
+            section_word_target = min(section_word_target, 450)
+
+        await sse_manager.publish(project_id, "section_started", {
+            "project_id": project_id,
+            "section": sec_key,
+        })
+
+        section_writer_task_ids: list[str] = []
+
+        async with session_factory() as session:
+            writer_input = {
+                "section": sec_key,
+                "topic": topic,
+                "word_count": section_word_target,
+                "section_plan": section_info,
+                "research_data": {
+                    "sources": verified_sources,
+                    "summaries": research_result.get("summaries", []),
+                    "thesis": thesis_statement,
+                    "section_queries": section_info.get("research_queries", []),
+                    "evidence_pack": section_evidence,
+                    "research_summary": research_result.get("summary", ""),
+                },
+            }
+            if ft_writing_style:
+                writer_input["writing_style"] = ft_writing_style
+
+            writer_task = await self._create_task(session, project_id, "writer", writer_input, [dep_task_id])
+            await session.commit()
+            section_writer_task_ids.append(writer_task.id)
+
+            write_result = await self._run_task(writer_task, session, project_id, writer_input)
+            written_content = write_result.get("content", "")
+            revision_attempts_used = 0
+            section_started_at = time.monotonic()
+            stop_reason = "initial_review"
+
+            grounding_input = {
+                "section": sec_key,
+                "content": written_content,
+                "evidence_pack": section_evidence,
+                "revision_attempt": revision_attempts_used,
+            }
+            grounding_task = await self._create_task(session, project_id, "grounding", grounding_input, [writer_task.id])
+            await session.commit()
+            grounding_result = await self._run_task(grounding_task, session, project_id, grounding_input)
+
+            await sse_manager.publish(project_id, "section_grounding_complete", {
+                "project_id": project_id,
+                "section": sec_key,
+                "grounding_score": grounding_result.get("score", 0.0),
+            })
+
+            review_input = {
+                "section": sec_key,
+                "content": written_content,
+                "expected_word_count": section_info.get("word_count_target", 500),
+                "evidence_pack": section_evidence,
+                "grounding_summary": grounding_result,
+                "revision_attempt": revision_attempts_used,
+            }
+            if ft_rubric:
+                review_input["rubric"] = ft_rubric
+            reviewer_task = await self._create_task(session, project_id, "reviewer", review_input, [writer_task.id])
+            await session.commit()
+
+            review_result = await self._run_task(reviewer_task, session, project_id, review_input)
+
+            await sse_manager.publish(project_id, "section_review_complete", {
+                "project_id": project_id,
+                "section": sec_key,
+                "review_score": review_result.get("score", 0.0),
+            })
+
+            current_score = float(review_result.get("score", 0.0))
+            approved = bool(review_result.get("approved", False)) and current_score >= section_target_score
+            if approved:
+                stop_reason = "target_score_reached"
+            best_snapshot = {
+                "content": written_content,
+                "review": review_result,
+                "grounding": grounding_result,
+                "score": current_score,
+                "subheadings": write_result.get("subheadings", []),
+            }
+            plateau_rounds = 0
+            low_grounding_rounds = 1 if float(grounding_result.get("score", 0.0)) < 0.55 else 0
+
+            while not approved:
+                if revision_attempts_used >= section_max_attempts:
+                    stop_reason = "max_revision_attempts"
+                    break
+
+                elapsed_minutes = (time.monotonic() - section_started_at) / 60.0
+                if elapsed_minutes >= settings.MAX_SECTION_REVISION_MINUTES:
+                    stop_reason = "max_revision_minutes"
+                    break
+
+                revision_attempts_used += 1
+                structured_feedback = self._build_revision_feedback(review_result, grounding_result, revision_attempts_used)
+                revised_input = {
+                    **writer_input,
+                    "revision_attempt": revision_attempts_used,
+                    "feedback": json.dumps(structured_feedback),
+                }
+                writer_task2 = await self._create_task(session, project_id, "writer", revised_input, [reviewer_task.id])
+                await session.commit()
+                section_writer_task_ids.append(writer_task2.id)
+                write_result = await self._run_task(writer_task2, session, project_id, revised_input)
+                revised_content = write_result.get("content", written_content)
+
+                reground_input = {
+                    "section": sec_key,
+                    "content": revised_content,
+                    "evidence_pack": section_evidence,
+                    "revision_attempt": revision_attempts_used,
+                }
+                reground_task = await self._create_task(session, project_id, "grounding", reground_input, [writer_task2.id])
+                await session.commit()
+                reground_result = await self._run_task(reground_task, session, project_id, reground_input)
+
+                re_review_input = {
+                    "section": sec_key,
+                    "content": revised_content,
+                    "expected_word_count": section_info.get("word_count_target", 500),
+                    "evidence_pack": section_evidence,
+                    "grounding_summary": reground_result,
+                    "revision_attempt": revision_attempts_used,
+                }
+                if ft_rubric:
+                    re_review_input["rubric"] = ft_rubric
+                re_review_task = await self._create_task(session, project_id, "reviewer", re_review_input, [writer_task2.id])
+                await session.commit()
+                re_review_result = await self._run_task(re_review_task, session, project_id, re_review_input)
+
+                new_score = float(re_review_result.get("score", 0.0))
+                score_delta = new_score - current_score
+
+                written_content = revised_content
+                review_result = re_review_result
+                grounding_result = reground_result
+                current_score = new_score
+
+                if new_score > best_snapshot["score"]:
+                    best_snapshot = {
+                        "content": revised_content,
+                        "review": re_review_result,
+                        "grounding": reground_result,
+                        "score": new_score,
+                        "subheadings": write_result.get("subheadings", []),
+                    }
+
+                if score_delta < settings.MIN_REVISION_DELTA:
+                    plateau_rounds += 1
+                else:
+                    plateau_rounds = 0
+
+                if float(reground_result.get("score", 0.0)) < 0.55:
+                    low_grounding_rounds += 1
+                else:
+                    low_grounding_rounds = 0
+
+                approved = bool(re_review_result.get("approved", False)) and new_score >= section_target_score
+                if approved:
+                    stop_reason = "target_score_reached"
+                    break
+                if plateau_rounds >= 2:
+                    stop_reason = "score_plateau"
+                    break
+                if low_grounding_rounds >= 2:
+                    stop_reason = "grounding_persistent_low"
+                    break
+
+            if not approved and stop_reason == "initial_review":
+                stop_reason = "review_not_approved"
+
+            written_content = best_snapshot["content"]
+            review_result = best_snapshot["review"]
+            grounding_result = best_snapshot["grounding"]
+
+            await sse_manager.publish(
+                project_id,
+                "section_approved" if approved else "section_done",
+                {
+                    "project_id": project_id,
+                    "section": sec_key,
+                    "score": review_result.get("score", 0.0),
+                    "approved": approved,
+                    "stop_reason": stop_reason,
+                },
+            )
+
+            section_quality = {
+                "title": section_info.get("title", sec_key.title()),
+                "score": review_result.get("score", 0.0),
+                "approved": bool(review_result.get("approved", False)) and float(review_result.get("score", 0.0)) >= section_target_score,
+                "target_score": section_target_score,
+                "stop_reason": stop_reason,
+                "revision_attempts": revision_attempts_used,
+                "expected_word_count": section_word_target,
+                "evidence_count": evidence_count,
+                "actual_word_count": len(written_content.split()),
+                "citation_count": review_result.get("citation_count", 0),
+                "grounding_score": grounding_result.get("score", 0.0),
+                "grounding_issues": grounding_result.get("issues", []),
+                "unsupported_claim_count": grounding_result.get("unsupported_claim_count", 0),
+                "category_scores": review_result.get("category_scores", {}),
+                "blocking_issues": review_result.get("blocking_issues", []),
+                "feedback": review_result.get("feedback", ""),
+                "suggestions": review_result.get("suggestions", []),
+                "strengths": review_result.get("strengths", []),
+            }
+
+            # Flush any remaining log entries in the fresh session
+            await session.commit()
+
+            return {
+                "sec_key": sec_key,
+                "written_content": written_content,
+                "section_quality": section_quality,
+                "subheadings": best_snapshot.get("subheadings", []),
+                "writer_task_ids": section_writer_task_ids,
+            }
+
     async def _run_agent_in_fresh_session(
         self, task_id: str, agent_name: str, input_data: dict, project_id: str
     ) -> dict:
@@ -844,7 +972,9 @@ class WorkerPool:
         from app.models import Task
         from sqlalchemy import select as sel
 
-        async with AsyncSessionLocal() as session:
+        session_factory = getattr(self, "_section_session_factory", None) or AsyncSessionLocal
+
+        async with session_factory() as session:
             # Mark task as running
             task_row = (await session.execute(sel(Task).where(Task.id == task_id))).scalar_one_or_none()
             if task_row:

@@ -26,6 +26,7 @@ import asyncio
 import html
 import json
 import logging
+import random
 import re
 import time
 from typing import Optional
@@ -48,6 +49,37 @@ _MIN_SENTENCE_LEN = 35       # sentences shorter than this are discarded
 _MAX_SENTENCE_LEN = 380      # sentences longer than this are truncated
 _MAX_SOURCES_PER_QUERY = 3   # Wikipedia pages per query
 _TOP_QUERIES = 3             # max queries sent to each API
+
+# ---------------------------------------------------------------------------
+# Retry helper (mirrors the one in research.py)
+# ---------------------------------------------------------------------------
+
+
+async def _http_get_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: dict | None = None,
+    headers: dict | None = None,
+    max_attempts: int = 3,
+    base_delay: float = 0.5,
+) -> httpx.Response:
+    """GET *url* with exponential back-off retry on transport / 5xx errors."""
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            resp = await client.get(url, params=params, headers=headers)
+            if resp.status_code < 500:
+                return resp
+            last_exc = httpx.HTTPStatusError(
+                f"HTTP {resp.status_code}", request=resp.request, response=resp
+            )
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            last_exc = exc
+        if attempt < max_attempts - 1:
+            delay = base_delay * (2 ** attempt) + random.uniform(0.0, 0.1)
+            await asyncio.sleep(delay)
+    raise last_exc  # type: ignore[misc]
 
 
 class WebSearchAgent(AgentBase):
@@ -112,71 +144,72 @@ class WebSearchAgent(AgentBase):
         """
         results: list[dict] = []
         current_year = time.gmtime().tm_year
+        _headers = {"User-Agent": "EssayWritingAgent/1.0 (research module)"}
 
-        for query in queries:
-            start = time.monotonic()
-            try:
-                async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-                    resp = await client.get(
-                        _DDGO_URL,
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            for query in queries:
+                start = time.monotonic()
+                try:
+                    resp = await _http_get_with_retry(
+                        client, _DDGO_URL,
                         params={
                             "q": query,
                             "format": "json",
                             "no_html": "1",
                             "skip_disambig": "1",
                         },
-                        headers={"User-Agent": "EssayWritingAgent/1.0 (research module)"},
+                        headers=_headers,
                     )
-                duration = (time.monotonic() - start) * 1000
-                await self._log_api_call(db, _DDGO_URL, "GET", self.name, duration, resp.status_code)
+                    duration = (time.monotonic() - start) * 1000
+                    await self._log_api_call(db, _DDGO_URL, "GET", self.name, duration, resp.status_code)
 
-                if resp.status_code != 200 or not resp.content:
-                    continue
-
-                data = resp.json()
-
-                # Primary abstract (usually from Wikipedia)
-                abstract_text = (data.get("AbstractText") or "").strip()
-                abstract_url = (data.get("AbstractURL") or "").strip()
-                abstract_title = (data.get("Heading") or query).strip()
-
-                if abstract_text and abstract_url:
-                    preprocessed = self._preprocess_text(abstract_text, topic)
-                    if preprocessed:
-                        results.append({
-                            "title": abstract_title,
-                            "authors": [],
-                            "year": current_year,
-                            "abstract": preprocessed,
-                            "url": abstract_url,
-                            "doi": "",
-                            "source": "web_search",
-                        })
-
-                # Related topics as supplementary sources
-                for related in (data.get("RelatedTopics") or [])[:3]:
-                    if not isinstance(related, dict):
+                    if resp.status_code != 200 or not resp.content:
                         continue
-                    text = (related.get("Text") or "").strip()
-                    url = (related.get("FirstURL") or "").strip()
-                    if not text or not url:
-                        continue
-                    preprocessed = self._preprocess_text(text, topic)
-                    if preprocessed:
-                        results.append({
-                            "title": self._title_from_url(url) or query,
-                            "authors": [],
-                            "year": current_year,
-                            "abstract": preprocessed,
-                            "url": url,
-                            "doi": "",
-                            "source": "web_search",
-                        })
 
-            except Exception as exc:
-                duration = (time.monotonic() - start) * 1000
-                await self._log_api_call(db, _DDGO_URL, "GET", self.name, duration, 500)
-                logger.debug("DuckDuckGo search failed for '%s': %s", query, exc)
+                    data = resp.json()
+
+                    # Primary abstract (usually from Wikipedia)
+                    abstract_text = (data.get("AbstractText") or "").strip()
+                    abstract_url = (data.get("AbstractURL") or "").strip()
+                    abstract_title = (data.get("Heading") or query).strip()
+
+                    if abstract_text and abstract_url:
+                        preprocessed = self._preprocess_text(abstract_text, topic)
+                        if preprocessed:
+                            results.append({
+                                "title": abstract_title,
+                                "authors": [],
+                                "year": current_year,
+                                "abstract": preprocessed,
+                                "url": abstract_url,
+                                "doi": "",
+                                "source": "web_search",
+                            })
+
+                    # Related topics as supplementary sources
+                    for related in (data.get("RelatedTopics") or [])[:3]:
+                        if not isinstance(related, dict):
+                            continue
+                        text = (related.get("Text") or "").strip()
+                        url = (related.get("FirstURL") or "").strip()
+                        if not text or not url:
+                            continue
+                        preprocessed = self._preprocess_text(text, topic)
+                        if preprocessed:
+                            results.append({
+                                "title": self._title_from_url(url) or query,
+                                "authors": [],
+                                "year": current_year,
+                                "abstract": preprocessed,
+                                "url": url,
+                                "doi": "",
+                                "source": "web_search",
+                            })
+
+                except Exception as exc:
+                    duration = (time.monotonic() - start) * 1000
+                    await self._log_api_call(db, _DDGO_URL, "GET", self.name, duration, 500)
+                    logger.debug("DuckDuckGo search failed for '%s': %s", query, exc)
 
         return results
 
@@ -195,14 +228,15 @@ class WebSearchAgent(AgentBase):
         results: list[dict] = []
         current_year = time.gmtime().tm_year
         seen_titles: set[str] = set()
+        _headers = {"User-Agent": "EssayWritingAgent/1.0"}
 
-        for query in queries:
-            # Step 1: search
-            start = time.monotonic()
-            try:
-                async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-                    search_resp = await client.get(
-                        _WIKI_SEARCH_URL,
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            for query in queries:
+                # Step 1: search
+                start = time.monotonic()
+                try:
+                    search_resp = await _http_get_with_retry(
+                        client, _WIKI_SEARCH_URL,
                         params={
                             "action": "query",
                             "list": "search",
@@ -211,28 +245,27 @@ class WebSearchAgent(AgentBase):
                             "srlimit": _MAX_SOURCES_PER_QUERY,
                             "srprop": "snippet|titlesnippet",
                         },
-                        headers={"User-Agent": "EssayWritingAgent/1.0"},
+                        headers=_headers,
                     )
-                duration = (time.monotonic() - start) * 1000
-                await self._log_api_call(db, _WIKI_SEARCH_URL, "GET", self.name, duration, search_resp.status_code)
+                    duration = (time.monotonic() - start) * 1000
+                    await self._log_api_call(db, _WIKI_SEARCH_URL, "GET", self.name, duration, search_resp.status_code)
 
-                if search_resp.status_code != 200 or not search_resp.content:
-                    continue
+                    if search_resp.status_code != 200 or not search_resp.content:
+                        continue
 
-                search_data = search_resp.json()
-                titles = [
-                    hit["title"]
-                    for hit in search_data.get("query", {}).get("search", [])
-                    if hit.get("title") and hit["title"] not in seen_titles
-                ]
-                if not titles:
-                    continue
+                    search_data = search_resp.json()
+                    titles = [
+                        hit["title"]
+                        for hit in search_data.get("query", {}).get("search", [])
+                        if hit.get("title") and hit["title"] not in seen_titles
+                    ]
+                    if not titles:
+                        continue
 
-                # Step 2: batch-fetch extracts for all titles from this query
-                start2 = time.monotonic()
-                async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-                    extract_resp = await client.get(
-                        _WIKI_SEARCH_URL,
+                    # Step 2: batch-fetch extracts for all titles from this query
+                    start2 = time.monotonic()
+                    extract_resp = await _http_get_with_retry(
+                        client, _WIKI_SEARCH_URL,
                         params={
                             "action": "query",
                             "prop": "extracts",
@@ -242,46 +275,46 @@ class WebSearchAgent(AgentBase):
                             "format": "json",
                             "redirects": "1",
                         },
-                        headers={"User-Agent": "EssayWritingAgent/1.0"},
+                        headers=_headers,
                     )
-                duration2 = (time.monotonic() - start2) * 1000
-                await self._log_api_call(db, _WIKI_SEARCH_URL, "GET", self.name, duration2, extract_resp.status_code)
+                    duration2 = (time.monotonic() - start2) * 1000
+                    await self._log_api_call(db, _WIKI_SEARCH_URL, "GET", self.name, duration2, extract_resp.status_code)
 
-                if extract_resp.status_code != 200 or not extract_resp.content:
-                    continue
-
-                extract_data = extract_resp.json()
-                pages = extract_data.get("query", {}).get("pages", {})
-
-                for page in pages.values():
-                    title = (page.get("title") or "").strip()
-                    extract = (page.get("extract") or "").strip()
-                    page_id = page.get("pageid", -1)
-
-                    # Skip missing pages (negative page IDs) or already processed
-                    if page_id < 0 or not title or not extract or title in seen_titles:
-                        continue
-                    seen_titles.add(title)
-
-                    preprocessed = self._preprocess_text(extract, topic)
-                    if not preprocessed:
+                    if extract_resp.status_code != 200 or not extract_resp.content:
                         continue
 
-                    url = f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}"
-                    results.append({
-                        "title": title,
-                        "authors": [],
-                        "year": current_year,
-                        "abstract": preprocessed,
-                        "url": url,
-                        "doi": "",
-                        "source": "web_search",
-                    })
+                    extract_data = extract_resp.json()
+                    pages = extract_data.get("query", {}).get("pages", {})
 
-            except Exception as exc:
-                duration = (time.monotonic() - start) * 1000
-                await self._log_api_call(db, _WIKI_SEARCH_URL, "GET", self.name, duration, 500)
-                logger.debug("Wikipedia search failed for '%s': %s", query, exc)
+                    for page in pages.values():
+                        title = (page.get("title") or "").strip()
+                        extract = (page.get("extract") or "").strip()
+                        page_id = page.get("pageid", -1)
+
+                        # Skip missing pages (negative page IDs) or already processed
+                        if page_id < 0 or not title or not extract or title in seen_titles:
+                            continue
+                        seen_titles.add(title)
+
+                        preprocessed = self._preprocess_text(extract, topic)
+                        if not preprocessed:
+                            continue
+
+                        url = f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}"
+                        results.append({
+                            "title": title,
+                            "authors": [],
+                            "year": current_year,
+                            "abstract": preprocessed,
+                            "url": url,
+                            "doi": "",
+                            "source": "web_search",
+                        })
+
+                except Exception as exc:
+                    duration = (time.monotonic() - start) * 1000
+                    await self._log_api_call(db, _WIKI_SEARCH_URL, "GET", self.name, duration, 500)
+                    logger.debug("Wikipedia search failed for '%s': %s", query, exc)
 
         return results
 

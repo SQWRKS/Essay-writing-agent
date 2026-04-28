@@ -1,5 +1,7 @@
+import asyncio
 import json
 import logging
+import random
 import re
 import time
 
@@ -11,6 +13,41 @@ from app.core.config import settings
 from app.routing.model_config import AGENT_MODELS
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Retry helper
+# ---------------------------------------------------------------------------
+
+async def _http_get_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: dict | None = None,
+    headers: dict | None = None,
+    max_attempts: int = 3,
+    base_delay: float = 0.5,
+) -> httpx.Response:
+    """GET *url* with exponential back-off retry on network / 5xx errors.
+
+    Raises the last exception if all attempts fail.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            resp = await client.get(url, params=params, headers=headers)
+            # Retry on server errors only; client errors (4xx) are returned
+            # immediately so the caller can fall back to mock sources.
+            if resp.status_code < 500:
+                return resp
+            last_exc = httpx.HTTPStatusError(
+                f"HTTP {resp.status_code}", request=resp.request, response=resp
+            )
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            last_exc = exc
+        if attempt < max_attempts - 1:
+            delay = base_delay * (2 ** attempt) + random.uniform(0.0, 0.1)
+            await asyncio.sleep(delay)
+    raise last_exc  # type: ignore[misc]
 
 
 MOCK_SOURCES = [
@@ -215,8 +252,25 @@ class ResearchAgent(AgentBase):
         combined = list(dict.fromkeys(queries + fallback))
         return combined
 
+    def _title_jaccard(self, a: str, b: str) -> float:
+        """Jaccard similarity on word token sets for two title strings."""
+        tokens_a = set(re.findall(r"\b[a-z]{3,}\b", a.lower()))
+        tokens_b = set(re.findall(r"\b[a-z]{3,}\b", b.lower()))
+        if not tokens_a and not tokens_b:
+            return 1.0
+        union = tokens_a | tokens_b
+        if not union:
+            return 0.0
+        return len(tokens_a & tokens_b) / len(union)
+
     def _deduplicate_sources(self, sources: list[dict]) -> list[dict]:
-        """Remove duplicate sources based on DOI (preferred) then normalised title."""
+        """Remove duplicate sources.
+
+        Pass 1 — exact DOI / exact normalised title match.
+        Pass 2 — fuzzy Jaccard token-overlap on titles (threshold 0.85) to
+                  catch the same paper appearing from multiple providers with
+                  slightly different titles (e.g. arXiv vs Semantic Scholar).
+        """
         seen_dois: set[str] = set()
         seen_titles: set[str] = set()
         unique: list[dict] = []
@@ -226,6 +280,15 @@ class ResearchAgent(AgentBase):
             if doi and doi in seen_dois:
                 continue
             if title_key and title_key in seen_titles:
+                continue
+            # Fuzzy pass: check Jaccard against all accepted titles
+            is_near_dup = False
+            if title_key:
+                for accepted_title in seen_titles:
+                    if self._title_jaccard(title_key, accepted_title) >= 0.85:
+                        is_near_dup = True
+                        break
+            if is_near_dup:
                 continue
             if doi:
                 seen_dois.add(doi)
@@ -356,113 +419,117 @@ class ResearchAgent(AgentBase):
 
     async def _search_arxiv(self, queries: list[str], project_id: str, db) -> list[dict]:
         results = []
-        for query in queries[:5]:
-            start = time.monotonic()
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.get(
-                        "https://export.arxiv.org/api/query",
+        _url = "https://export.arxiv.org/api/query"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for query in queries[:5]:
+                start = time.monotonic()
+                try:
+                    resp = await _http_get_with_retry(
+                        client, _url,
                         params={"search_query": f"all:{query}", "max_results": 4},
                     )
-                duration = (time.monotonic() - start) * 1000
-                await self._log_api_call(db, "https://export.arxiv.org/api/query", "GET", self.name, duration, resp.status_code)
-                if resp.status_code == 200:
-                    results.extend(self._parse_arxiv(resp.text))
-            except Exception:
-                duration = (time.monotonic() - start) * 1000
-                await self._log_api_call(db, "https://export.arxiv.org/api/query", "GET", self.name, duration, 500)
-                results.extend(self._mock_sources("arxiv", [query]))
+                    duration = (time.monotonic() - start) * 1000
+                    await self._log_api_call(db, _url, "GET", self.name, duration, resp.status_code)
+                    if resp.status_code == 200:
+                        results.extend(self._parse_arxiv(resp.text))
+                except Exception:
+                    duration = (time.monotonic() - start) * 1000
+                    await self._log_api_call(db, _url, "GET", self.name, duration, 500)
+                    results.extend(self._mock_sources("arxiv", [query]))
         return results
 
     async def _search_semantic_scholar(self, queries: list[str], project_id: str, db) -> list[dict]:
         results = []
-        for query in queries[:5]:
-            start = time.monotonic()
-            try:
-                async with httpx.AsyncClient(timeout=12.0) as client:
-                    resp = await client.get(
-                        "https://api.semanticscholar.org/graph/v1/paper/search",
+        _url = "https://api.semanticscholar.org/graph/v1/paper/search"
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            for query in queries[:5]:
+                start = time.monotonic()
+                try:
+                    resp = await _http_get_with_retry(
+                        client, _url,
                         params={
                             "query": query,
                             "limit": 4,
                             "fields": "title,abstract,year,url,authors,externalIds,venue,citationCount",
                         },
                     )
-                duration = (time.monotonic() - start) * 1000
-                await self._log_api_call(db, "https://api.semanticscholar.org/graph/v1/paper/search", "GET", self.name, duration, resp.status_code)
-                if resp.status_code == 200:
-                    payload = resp.json() if resp.content else {}
-                    for paper in payload.get("data", []):
-                        authors = [author.get("name") for author in paper.get("authors", []) if author.get("name")]
-                        external_ids = paper.get("externalIds") or {}
-                        results.append(
-                            {
-                                "title": paper.get("title") or "Unknown",
-                                "authors": authors[:5],
-                                "year": paper.get("year") or 2024,
-                                "abstract": (paper.get("abstract") or "")[:1200],
-                                "url": paper.get("url") or "",
-                                "doi": external_ids.get("DOI") or "",
-                                "venue": paper.get("venue") or "",
-                                "citation_count": paper.get("citationCount") or 0,
-                                "source": "semantic_scholar",
-                            }
-                        )
-                else:
+                    duration = (time.monotonic() - start) * 1000
+                    await self._log_api_call(db, _url, "GET", self.name, duration, resp.status_code)
+                    if resp.status_code == 200:
+                        payload = resp.json() if resp.content else {}
+                        for paper in payload.get("data", []):
+                            authors = [author.get("name") for author in paper.get("authors", []) if author.get("name")]
+                            external_ids = paper.get("externalIds") or {}
+                            results.append(
+                                {
+                                    "title": paper.get("title") or "Unknown",
+                                    "authors": authors[:5],
+                                    "year": paper.get("year") or 2024,
+                                    "abstract": (paper.get("abstract") or "")[:1200],
+                                    "url": paper.get("url") or "",
+                                    "doi": external_ids.get("DOI") or "",
+                                    "venue": paper.get("venue") or "",
+                                    "citation_count": paper.get("citationCount") or 0,
+                                    "source": "semantic_scholar",
+                                }
+                            )
+                    else:
+                        results.extend(self._mock_sources("semantic_scholar", [query]))
+                except Exception:
+                    duration = (time.monotonic() - start) * 1000
+                    await self._log_api_call(db, _url, "GET", self.name, duration, 500)
                     results.extend(self._mock_sources("semantic_scholar", [query]))
-            except Exception:
-                duration = (time.monotonic() - start) * 1000
-                await self._log_api_call(db, "https://api.semanticscholar.org/graph/v1/paper/search", "GET", self.name, duration, 500)
-                results.extend(self._mock_sources("semantic_scholar", [query]))
         return results
 
     async def _search_crossref(self, queries: list[str], project_id: str, db) -> list[dict]:
         results = []
-        for query in queries[:5]:
-            start = time.monotonic()
-            try:
-                async with httpx.AsyncClient(timeout=12.0) as client:
-                    resp = await client.get(
-                        "https://api.crossref.org/works",
+        _url = "https://api.crossref.org/works"
+        _headers = {"User-Agent": "EssayWritingAgent/1.0 (research module)"}
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            for query in queries[:5]:
+                start = time.monotonic()
+                try:
+                    resp = await _http_get_with_retry(
+                        client, _url,
                         params={"query": query, "rows": 4, "sort": "relevance"},
-                        headers={"User-Agent": "EssayWritingAgent/1.0 (research module)"},
+                        headers=_headers,
                     )
-                duration = (time.monotonic() - start) * 1000
-                await self._log_api_call(db, "https://api.crossref.org/works", "GET", self.name, duration, resp.status_code)
-                if resp.status_code == 200:
-                    payload = resp.json() if resp.content else {}
-                    for item in payload.get("message", {}).get("items", []):
-                        authors = []
-                        for author in item.get("author", []) or []:
-                            family = author.get("family") or ""
-                            given = author.get("given") or ""
-                            if family or given:
-                                authors.append(f"{family}, {given}".strip(", "))
+                    duration = (time.monotonic() - start) * 1000
+                    await self._log_api_call(db, _url, "GET", self.name, duration, resp.status_code)
+                    if resp.status_code == 200:
+                        payload = resp.json() if resp.content else {}
+                        for item in payload.get("message", {}).get("items", []):
+                            authors = []
+                            for author in item.get("author", []) or []:
+                                family = author.get("family") or ""
+                                given = author.get("given") or ""
+                                if family or given:
+                                    authors.append(f"{family}, {given}".strip(", "))
 
-                        title_list = item.get("title", []) or []
-                        abstract = (item.get("abstract") or "").replace("<jats:p>", "").replace("</jats:p>", "")
-                        year = 2024
-                        issued = item.get("issued", {}).get("date-parts", [])
-                        if issued and issued[0]:
-                            year = issued[0][0]
-                        doi = item.get("DOI") or ""
-                        results.append(
-                            {
-                                "title": title_list[0] if title_list else "Unknown",
-                                "authors": authors[:5],
-                                "year": year,
-                                "abstract": abstract[:1200],
-                                "url": item.get("URL") or (f"https://doi.org/{doi}" if doi else ""),
-                                "doi": doi,
-                                "source": "web",
-                            }
-                        )
-                else:
+                            title_list = item.get("title", []) or []
+                            abstract = (item.get("abstract") or "").replace("<jats:p>", "").replace("</jats:p>", "")
+                            year = 2024
+                            issued = item.get("issued", {}).get("date-parts", [])
+                            if issued and issued[0]:
+                                year = issued[0][0]
+                            doi = item.get("DOI") or ""
+                            results.append(
+                                {
+                                    "title": title_list[0] if title_list else "Unknown",
+                                    "authors": authors[:5],
+                                    "year": year,
+                                    "abstract": abstract[:1200],
+                                    "url": item.get("URL") or (f"https://doi.org/{doi}" if doi else ""),
+                                    "doi": doi,
+                                    "source": "web",
+                                }
+                            )
+                    else:
+                        results.extend(self._mock_sources("web", [query]))
+                except Exception:
+                    duration = (time.monotonic() - start) * 1000
+                    await self._log_api_call(db, _url, "GET", self.name, duration, 500)
                     results.extend(self._mock_sources("web", [query]))
-            except Exception:
-                duration = (time.monotonic() - start) * 1000
-                await self._log_api_call(db, "https://api.crossref.org/works", "GET", self.name, duration, 500)
-                results.extend(self._mock_sources("web", [query]))
         return results
 
     def _parse_arxiv(self, xml_text: str) -> list[dict]:

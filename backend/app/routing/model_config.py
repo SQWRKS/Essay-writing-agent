@@ -53,7 +53,9 @@ AGENT_MODELS: dict[str, dict[str, str]] = {
         "expensive": MODEL_GPT5,       # escalate when synthesising multiple sources
     },
     "thesis": {
-        "default": MODEL_GPT5,
+        "default": MODEL_GPT5,          # backward-compat alias for expensive model
+        "cheap": MODEL_DEEPSEEK,        # initial cheap generation pass
+        "expensive": MODEL_GPT5,        # escalate when thesis is weak or vague
     },
     "verification": {
         "cheap": MODEL_GPT5_MINI,      # optional flagging pre-check

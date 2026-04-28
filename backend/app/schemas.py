@@ -157,6 +157,21 @@ class HealthResponse(BaseModel):
     database: str
 
 
+class ContentUpdate(BaseModel):
+    """Schema for manually-edited document content.
+
+    Both ``sections`` and ``metadata`` are optional so partial updates are
+    allowed, but any key present must be a dict — not a scalar or list.
+    Unknown top-level keys are forbidden so a mis-shaped payload is rejected
+    before it can silently overwrite the project's content JSON.
+    """
+
+    sections: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+    model_config = {"extra": "forbid"}
+
+
 class RunAgentRequest(BaseModel):
     agent_name: str
     input_data: Dict[str, Any] = Field(default_factory=dict)

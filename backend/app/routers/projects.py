@@ -12,7 +12,7 @@ from sqlalchemy import select
 
 from app.database import get_db
 from app.models import Project, Task, AgentState
-from app.schemas import ProjectCreate, ProjectRead, ProjectUpdate, TaskRead, RunAgentRequest
+from app.schemas import ProjectCreate, ProjectRead, ProjectUpdate, TaskRead, RunAgentRequest, ContentUpdate
 from app.orchestration.worker_pool import WorkerPool
 from app.core.sse import sse_manager
 
@@ -99,7 +99,7 @@ async def get_project(project_id: str, db: AsyncSession = Depends(get_db)):
 @router.put("/{project_id}/content")
 async def update_project_content(
     project_id: str,
-    payload: dict,
+    payload: ContentUpdate,
     db: AsyncSession = Depends(get_db),
 ):
     """Persist manually edited document content back to the database."""
@@ -108,7 +108,7 @@ async def update_project_content(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    project.content = json.dumps(payload) if not isinstance(payload, str) else payload
+    project.content = payload.model_dump_json(exclude_none=False)
     project.updated_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(project)

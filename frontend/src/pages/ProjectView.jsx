@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   Play, Pause, Trash2, RefreshCw, AlertCircle, CheckCircle2, Clock, Bot, Layers, ShieldCheck, BookOpen, GitBranch,
+  ChevronDown, ChevronUp, FileSearch, AlertTriangle,
 } from 'lucide-react'
 import { getProject, runPipeline, getTasks, pauseProject, deleteProject } from '../api/client'
 import { useSSE } from '../hooks/useSSE'
@@ -16,6 +17,7 @@ const AGENT_NAMES = [
   'grounding',
   'reviewer',
   'coherence',
+  'plagiarism',
   'citation',
   'figure',
 ]
@@ -87,6 +89,7 @@ export default function ProjectView() {
   const [running, setRunning] = useState(false)
   const [runMsg, setRunMsg] = useState(null)
   const [actionBusy, setActionBusy] = useState(false)
+  const [qualityDetailsOpen, setQualityDetailsOpen] = useState(false)
 
   const { events, connected } = useSSE(id)
 
@@ -218,6 +221,9 @@ export default function ProjectView() {
   const sectionSubheadings = parsedContent.metadata?.subheadings || {}
   const coherence = quality.coherence || null
   const topSources = parsedContent.metadata?.research?.top_sources || []
+  const nlpAnalysis = parsedContent.metadata?.nlp_analysis || null
+  const plagiarism = parsedContent.metadata?.plagiarism || null
+  const hasQualityDetails = !!(nlpAnalysis || plagiarism)
 
   return (
     <div className="max-w-5xl mx-auto space-y-6">
@@ -424,6 +430,140 @@ export default function ProjectView() {
               </div>
             )}
           </div>
+        </div>
+      )}
+
+      {/* Quality Details (NLP Analysis + Plagiarism) */}
+      {hasQualityDetails && (
+        <div className="bg-white rounded-xl border border-gray-200 shadow-sm">
+          <button
+            className="w-full flex items-center justify-between px-6 py-4 text-left hover:bg-gray-50 rounded-xl transition-colors"
+            onClick={() => setQualityDetailsOpen((o) => !o)}
+          >
+            <h2 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+              <FileSearch size={18} /> Quality Details
+            </h2>
+            {qualityDetailsOpen ? <ChevronUp size={18} className="text-gray-400" /> : <ChevronDown size={18} className="text-gray-400" />}
+          </button>
+
+          {qualityDetailsOpen && (
+            <div className="px-6 pb-6 space-y-6 border-t border-gray-100">
+              {/* Plagiarism */}
+              {plagiarism && (
+                <div className="mt-4">
+                  <h3 className="text-sm font-semibold text-gray-700 mb-3 flex items-center gap-1.5">
+                    <AlertTriangle size={14} /> Plagiarism Check
+                  </h3>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-3">
+                    <div className="rounded-lg border border-gray-100 bg-gray-50 p-3">
+                      <p className="text-xs uppercase tracking-wider text-gray-500 font-semibold">Overall Score</p>
+                      <p className="mt-1 text-xl font-bold text-gray-900">{plagiarism.score != null ? plagiarism.score : '—'}</p>
+                    </div>
+                    <div className="rounded-lg border border-gray-100 bg-gray-50 p-3">
+                      <p className="text-xs uppercase tracking-wider text-gray-500 font-semibold">Flagged Sections</p>
+                      <p className="mt-1 text-xl font-bold text-amber-700">{plagiarism.flagged_sections?.length ?? 0}</p>
+                    </div>
+                    <div className="rounded-lg border border-gray-100 bg-gray-50 p-3">
+                      <p className="text-xs uppercase tracking-wider text-gray-500 font-semibold">Source Overlap</p>
+                      <p className="mt-1 text-xl font-bold text-gray-900">{plagiarism.source_overlap_count ?? '—'}</p>
+                    </div>
+                  </div>
+                  {(plagiarism.warnings?.length > 0 || plagiarism.issues?.length > 0) && (
+                    <ul className="space-y-1 text-xs text-amber-700">
+                      {(plagiarism.warnings || plagiarism.issues || []).slice(0, 5).map((w, i) => (
+                        <li key={i} className="flex items-start gap-1.5">
+                          <AlertTriangle size={11} className="mt-0.5 shrink-0" /> {w}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+
+              {/* NLP Analysis */}
+              {nlpAnalysis && (
+                <div>
+                  <h3 className="text-sm font-semibold text-gray-700 mb-3">NLP Analysis</h3>
+                  <div className="space-y-4">
+                    {/* Readability */}
+                    {nlpAnalysis.readability && (
+                      <div className="rounded-lg border border-gray-100 bg-gray-50 p-4">
+                        <p className="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-2">Readability</p>
+                        <div className="flex flex-wrap gap-4 text-sm text-gray-700">
+                          {nlpAnalysis.readability.flesch_reading_ease != null && (
+                            <span>Flesch: <strong>{nlpAnalysis.readability.flesch_reading_ease}</strong></span>
+                          )}
+                          {nlpAnalysis.readability.grade_level != null && (
+                            <span>Grade Level: <strong>{nlpAnalysis.readability.grade_level}</strong></span>
+                          )}
+                          {nlpAnalysis.readability.avg_sentence_length != null && (
+                            <span>Avg Sentence: <strong>{nlpAnalysis.readability.avg_sentence_length} words</strong></span>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Structure Validator */}
+                    {nlpAnalysis.structure && (
+                      <div className="rounded-lg border border-gray-100 bg-gray-50 p-4">
+                        <p className="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-2">Structure</p>
+                        <div className="flex flex-wrap gap-4 text-sm text-gray-700">
+                          {nlpAnalysis.structure.section_count != null && (
+                            <span>Sections: <strong>{nlpAnalysis.structure.section_count}</strong></span>
+                          )}
+                          {nlpAnalysis.structure.word_count != null && (
+                            <span>Words: <strong>{nlpAnalysis.structure.word_count}</strong></span>
+                          )}
+                          {nlpAnalysis.structure.has_introduction != null && (
+                            <span>Intro: <strong>{nlpAnalysis.structure.has_introduction ? '✓' : '✗'}</strong></span>
+                          )}
+                          {nlpAnalysis.structure.has_conclusion != null && (
+                            <span>Conclusion: <strong>{nlpAnalysis.structure.has_conclusion ? '✓' : '✗'}</strong></span>
+                          )}
+                        </div>
+                        {nlpAnalysis.structure.issues?.length > 0 && (
+                          <ul className="mt-2 space-y-1 text-xs text-amber-700">
+                            {nlpAnalysis.structure.issues.slice(0, 3).map((issue, i) => (
+                              <li key={i}>• {issue}</li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Critic */}
+                    {nlpAnalysis.critic && (
+                      <div className="rounded-lg border border-gray-100 bg-gray-50 p-4">
+                        <p className="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-2">Critic Report</p>
+                        <div className="flex flex-wrap gap-4 text-sm text-gray-700 mb-2">
+                          {nlpAnalysis.critic.score != null && (
+                            <span>Score: <strong>{nlpAnalysis.critic.score}</strong></span>
+                          )}
+                          {nlpAnalysis.critic.overall_score != null && (
+                            <span>Score: <strong>{nlpAnalysis.critic.overall_score}</strong></span>
+                          )}
+                        </div>
+                        {nlpAnalysis.critic.issues?.length > 0 && (
+                          <ul className="space-y-1 text-xs text-amber-700">
+                            {nlpAnalysis.critic.issues.slice(0, 3).map((issue, i) => (
+                              <li key={i}>• {issue}</li>
+                            ))}
+                          </ul>
+                        )}
+                        {nlpAnalysis.critic.suggestions?.length > 0 && (
+                          <ul className="space-y-1 text-xs text-blue-700 mt-2">
+                            {nlpAnalysis.critic.suggestions.slice(0, 2).map((s, i) => (
+                              <li key={i}>• {s}</li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
