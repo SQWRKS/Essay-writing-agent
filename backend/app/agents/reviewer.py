@@ -46,7 +46,10 @@ class ReviewerAgent(AgentBase):
         revision_attempt = int(input_data.get("revision_attempt", 0))
         rubric: str = (input_data.get("rubric") or "").strip()
 
-        heuristic = self._heuristic_review(section, content, thesis, research_notes)
+        heuristic = self._heuristic_review(
+            section, content, expected_word_count, evidence_pack,
+            grounding_summary, revision_attempt, rubric=rubric,
+        )
         if is_llm_available():
             result = await self._llm_review(
                 section,
@@ -60,10 +63,7 @@ class ReviewerAgent(AgentBase):
                 rubric=rubric,
             )
         else:
-            result = self._heuristic_review(
-                section, content, expected_word_count, evidence_pack,
-                grounding_summary, revision_attempt, rubric=rubric,
-            )
+            result = heuristic
 
         await self._update_agent_state(db, project_id, "completed", result)
         return result
@@ -281,17 +281,28 @@ class ReviewerAgent(AgentBase):
             rubric_block = f"MARKING RUBRIC:\n{rubric[:800]}\nEvaluate the section against the above rubric criteria in addition to standard quality dimensions.\n\n" if rubric else ""
             # Truncate content to 2500 chars to reduce prompt tokens while
             # still giving the reviewer enough text to evaluate quality.
+            # Chain-of-thought: the model reasons step-by-step before scoring,
+            # which improves calibration and reduces surface-level judgements.
             prompt = (
-                f"Review the '{section}' section of an academic essay.\n"
-                f"Expected word count: {expected_word_count or 450}. Revision attempt: {revision_attempt}.\n"
-                "Score 0-1 across: coverage, structure, grounding, analysis, clarity.\n"
-                "Reject if generic, weakly grounded, underdeveloped, or lacking evidence citations.\n\n"
-                "Return JSON: score (float), approved (bool), feedback (string), "
-                "suggestions (array), strengths (array), blocking_issues (array), category_scores (object).\n\n"
+                f"You are an academic editor reviewing the '{section}' section of an essay.\n"
+                f"Expected word count: {expected_word_count or 450}. Revision attempt: {revision_attempt}.\n\n"
                 f"{rubric_block}"
                 f"Grounding summary: {json.dumps(grounding_summary)}\n"
                 f"Evidence pack: {evidence_digest}\n\n"
-                f"Content:\n{truncate_text(content, 2500)}"
+                f"Section content:\n{truncate_text(content, 2500)}\n\n"
+                "Think step-by-step before scoring:\n"
+                "Step 1 – Coverage: Does the section reach the expected word count and depth?\n"
+                "Step 2 – Structure: Is the argument logically ordered with clear transitions?\n"
+                "Step 3 – Grounding: Is every factual claim backed by a citation or the evidence pack?\n"
+                "Step 4 – Analysis: Does the section interpret evidence rather than just summarise it?\n"
+                "Step 5 – Clarity: Is the prose specific, free of generic boilerplate, and non-repetitive?\n"
+                "Step 6 – Blocking issues: List any issue that must be fixed before the section can be approved.\n\n"
+                "After reasoning through each step, return a single JSON object with keys:\n"
+                "score (float 0-1), approved (bool), feedback (string ≤2 sentences),\n"
+                "suggestions (array), strengths (array), blocking_issues (array),\n"
+                "category_scores (object with keys coverage, structure, grounding, analysis, clarity).\n"
+                "Reject (approved=false) if the section is generic, weakly grounded, underdeveloped, "
+                "or lacks evidence citations."
             )
             response_text = await timed_chat_completion(
                 prompt,

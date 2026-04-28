@@ -9,6 +9,7 @@ from app.agents.coherence import CoherenceAgent
 from app.agents.citation import CitationAgent
 from app.agents.figure import FigureAgent
 from app.agents.web_search import WebSearchAgent
+from app.agents.plagiarism import PlagiarismAgent
 
 AGENT_REGISTRY = {
     "planner": PlannerAgent,
@@ -22,4 +23,5 @@ AGENT_REGISTRY = {
     "coherence": CoherenceAgent,
     "citation": CitationAgent,
     "figure": FigureAgent,
+    "plagiarism": PlagiarismAgent,
 }

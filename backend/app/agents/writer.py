@@ -8,6 +8,29 @@ from app.core.config import settings
 from app.routing.model_config import AGENT_MODELS, WRITER_REFINE_SECTIONS
 
 
+# Maps section keys to the specific argumentative goal for build_prompt().
+SECTION_GUIDANCE: dict[str, str] = {
+    "introduction": "frame the topic, establish the central argument, and explain why it matters",
+    "literature_review": "synthesize existing scholarship and identify unresolved tensions or gaps",
+    "methodology": "justify the chosen approach and acknowledge its limitations",
+    "results": "present findings with specificity and distinguish robust patterns from weaker observations",
+    "discussion": "interpret findings, weigh implications against limitations, and relate back to the thesis",
+    "conclusion": "reinforce the core argument and end with a precise contribution or future direction",
+}
+
+# A one-paragraph few-shot example used to demonstrate the desired prose style.
+_FEW_SHOT_EXAMPLE = (
+    "EXAMPLE OF DESIRED ACADEMIC PROSE:\n"
+    '"Transformer-based retrieval systems demonstrated substantial gains in clinical question '
+    "answering, with benchmarks reporting up to 18% improvement in answer accuracy when retrieval "
+    "precision exceeded 0.75 [1]. However, these gains were sensitive to corpus coverage: "
+    "performance degraded noticeably in specialist sub-domains where annotated training data "
+    'remained scarce [2]. A key limitation acknowledged by reviewers is that most evaluations '
+    'relied on short-form factoid questions rather than longitudinal diagnostic reasoning, '
+    'leaving the generalizability of results to high-stakes clinical settings uncertain."'
+)
+
+
 SECTION_TEMPLATES = {
     "introduction": (
         "This paper examines {topic}. The significance of this research lies in its potential to advance "
@@ -132,6 +155,14 @@ class WriterAgent(AgentBase):
         section_plan = input_data.get("section_plan", {})
         feedback = input_data.get("feedback", "")
         writing_style: str = (input_data.get("writing_style") or "").strip()
+        # Accept thesis and research_notes from the top level of input_data so
+        # callers that pre-populate them outside research_data still work.
+        thesis: str = (input_data.get("thesis") or research_data.get("thesis") or "").strip()
+        research_notes: list[str] = (
+            input_data.get("research_notes")
+            or research_data.get("research_notes")
+            or []
+        )
 
         if not is_llm_available():
             raise RuntimeError(
@@ -141,7 +172,10 @@ class WriterAgent(AgentBase):
 
         result = await self._llm_write(
             section, topic, word_count_target, research_data, section_plan,
-            feedback, project_id, db, writing_style=writing_style,
+            feedback, project_id, db,
+            writing_style=writing_style,
+            thesis=thesis,
+            research_notes=research_notes,
         )
 
         await self._update_agent_state(db, project_id, "completed", result)
@@ -156,65 +190,93 @@ class WriterAgent(AgentBase):
         section_plan: dict | None = None,
         feedback: str = "",
     ) -> dict:
+        """Produce a structured fallback section without an LLM.
+
+        The output includes prose grounded in the supplied evidence pack,
+        inline citation markers, and optional thesis/must-cover language.
+        Meta-writing phrases (directives, objectives, revision notes) are
+        intentionally excluded so the result is usable as draft prose.
+        """
         section_plan = section_plan or {}
+        research_data = research_data or {}
         template = SECTION_TEMPLATES.get(section, SECTION_TEMPLATES["introduction"])
         content_parts = [template.format(topic=topic)]
 
         thesis_goal = section_plan.get("thesis_goal", "")
         if thesis_goal:
-            content_parts.append(f"The central claim in this section is that {thesis_goal.strip().rstrip('.')}." )
+            content_parts.append(
+                f"The central argument is that {thesis_goal.strip().rstrip('.')}."
+            )
 
         must_cover = section_plan.get("must_cover", [])
         if must_cover:
-            content_parts.append(
-                "The argument develops through "
-                + ", ".join(item.strip() for item in must_cover[:4] if str(item).strip())
-                + "."
-            )
+            items = ", ".join(item.strip() for item in must_cover[:4] if str(item).strip())
+            content_parts.append(f"The analysis covers {items}.")
 
         evidence_requirements = section_plan.get("evidence_requirements", [])
         if evidence_requirements:
-            content_parts.append(
-                "Evidence in this section is used to substantiate claims about "
-                + ", ".join(item.strip() for item in evidence_requirements[:3] if str(item).strip())
-                + "."
-            )
+            reqs = ", ".join(item.strip() for item in evidence_requirements[:3] if str(item).strip())
+            content_parts.append(f"The discussion is expected to address {reqs}.")
 
-        writing_directive = section_plan.get("writing_directive", "")
-        if writing_directive:
-            content_parts.append(
-                "The narrative emphasizes a clear argumentative progression from context to evidence and interpretation."
-            )
+        research_summary = (research_data.get("research_summary") or "").strip()
+        if research_summary:
+            content_parts.append(research_summary[:300].rstrip() + ("…" if len(research_summary) > 300 else ""))
+
+        # Inline evidence highlights with citation markers
+        evidence_pack = research_data.get("evidence_pack", [])
+        if evidence_pack:
+            highlight_lines = []
+            for idx, item in enumerate(evidence_pack[:4], 1):
+                finding = (item.get("key_findings") or item.get("abstract") or "").strip()
+                quant = item.get("quantitative_data", [])
+                quant_str = "; ".join(str(q) for q in quant[:2]) if quant else ""
+                source_title = (item.get("source") or {}).get("title", "")
+                if finding:
+                    line = f"[{idx}] {finding[:200]}"
+                    if quant_str:
+                        line += f" ({quant_str})"
+                    if source_title:
+                        line += f" [{source_title}]"
+                    highlight_lines.append(line)
+            if highlight_lines:
+                synthesis = (
+                    "These findings collectively support the central claim and highlight "
+                    "key mechanisms, trade-offs, and boundaries of current knowledge."
+                )
+                content_parts.append(
+                    "Evidence highlights:\n" + "\n".join(highlight_lines) + "\n\n" + synthesis
+                )
 
         if feedback:
             content_parts.append(
-                "Compared with earlier drafts, this section strengthens specificity, evidence linkage, and analytical depth."
-            )
-
-        section_queries = research_data.get("section_queries", [])
-        if section_queries:
-            query_line = "; ".join(section_queries[:3])
-            content_parts.append(
-                "This section is guided by targeted questions: "
-                f"{query_line}."
+                "Revisions address specificity, evidence linkage, and analytical depth."
             )
 
         content = "\n\n".join(content_parts)
         return {"section": section, "content": content, "word_count": len(content.split())}
 
     def build_prompt(self, payload: dict, stricter_feedback: str = "") -> str:
-        section_goal = SECTION_GUIDANCE.get(payload["section"], "advance the thesis with technical, evidence-based analysis")
+        """Build a full LLM prompt for a section from a structured payload dict.
+
+        Payload keys: section, topic, thesis, research_notes (list[str]),
+        section_queries (list[str]), research_summary, feedback, word_count.
+        """
+        section_goal = SECTION_GUIDANCE.get(
+            payload.get("section", ""),
+            "advance the thesis with technical, evidence-based analysis",
+        )
         return (
             f"Write the {payload['section']} section of a final-year university paper on '{payload['topic']}'. "
             f"The section must {section_goal}.\n\n"
-            f"Central thesis:\n{payload['thesis']}\n\n"
-            f"Structured research notes:\n{json.dumps(payload['research_notes'][:8])}\n\n"
-            f"Section queries:\n{json.dumps(payload['section_queries'][:5])}\n\n"
-            f"Literature synthesis:\n{payload['research_summary']}\n\n"
-            f"Revision feedback:\n{payload['feedback']}\n\n"
+            f"{_FEW_SHOT_EXAMPLE}\n\n"
+            f"Central thesis:\n{payload.get('thesis', '')}\n\n"
+            f"Structured research notes:\n{json.dumps(payload.get('research_notes', [])[:8])}\n\n"
+            f"Section queries:\n{json.dumps(payload.get('section_queries', [])[:5])}\n\n"
+            f"Literature synthesis:\n{payload.get('research_summary', '')}\n\n"
+            f"Revision feedback:\n{payload.get('feedback', '')}\n\n"
             f"Additional constraints:\n{stricter_feedback}\n\n"
             "Requirements:\n"
-            f"- Write approximately {payload['word_count']} words in polished academic prose.\n"
+            f"- Write approximately {payload.get('word_count', 500)} words in polished academic prose.\n"
             "- Use named studies, systems, datasets, methods, or case examples from the notes.\n"
             "- Include quantitative evidence whenever the notes provide it.\n"
             "- Use inline citations like [1], [2], [3] for factual claims.\n"
@@ -224,22 +286,45 @@ class WriterAgent(AgentBase):
             "Return only the final section text."
         )
 
-    def _grounded_write(self, payload: dict) -> str:
-        notes = payload["research_notes"][:6]
-        section = payload["section"]
-        topic = payload["topic"]
-        thesis = payload["thesis"] or f"The literature on {topic} supports a specific, evidence-grounded argument."
+    def _grounded_write(self, payload: dict) -> dict:
+        """Build a minimal grounded draft from research notes without an LLM.
 
-        paragraphs = [
-            f"{thesis} In the {section} context, the strongest evidence shows that {self._note_sentence(notes[0] if notes else topic, preserve_prefix=True)}",
-        ]
+        Used as a deterministic fallback when the primary LLM path is unavailable.
+        Assembles content paragraph-by-paragraph from the research notes supplied
+        in ``payload`` and trims or expands to approximate ``word_count_target``.
+        """
+        notes: list[str] = payload.get("research_notes", [])[:6]
+        section: str = payload.get("section", "introduction")
+        topic: str = payload.get("topic", "the topic")
+        word_count_target: int = int(payload.get("word_count", 500))
+        thesis: str = (
+            payload.get("thesis")
+            or f"The literature on {topic} supports a specific, evidence-grounded argument."
+        )
+
+        paragraphs: list[str] = []
+
+        # Opening paragraph: thesis + first evidence note
+        first_note = notes[0] if notes else f"{topic} is an active area of research."
+        paragraphs.append(
+            f"{thesis} "
+            f"In the {section} context, the available evidence indicates that {first_note.rstrip('.')}."
+        )
+
+        # Body paragraphs: one per remaining note
+        for i, note in enumerate(notes[1:], 2):
+            paragraphs.append(f"Further evidence [{i}] shows that {note.rstrip('.')}.")
+
+        # Closing synthesis
+        paragraphs.append(
+            f"Taken together, the evidence above supports the central argument "
+            f"and highlights both the contributions and the remaining uncertainties in the {topic} literature."
+        )
+
+        content = "\n\n".join(paragraphs)
+
+        # Trim to word_count_target if overlong
         words = content.split()
-        idx = 0
-        while len(words) < int(word_count_target * 0.82):
-            content += "\n\n" + expansion_pool[idx % len(expansion_pool)]
-            idx += 1
-            words = content.split()
-
         if len(words) > word_count_target:
             content = " ".join(words[:word_count_target]).strip()
 
@@ -256,6 +341,8 @@ class WriterAgent(AgentBase):
         project_id: str,
         db,
         writing_style: str = "",
+        thesis: str = "",
+        research_notes: list[str] | None = None,
     ) -> dict:
         """Write a section using cost-optimised model routing.
 
@@ -269,6 +356,7 @@ class WriterAgent(AgentBase):
         """
         try:
             section_plan = section_plan or {}
+            research_notes = research_notes or []
             # Token-efficient evidence selection: top 3 items are enough for grounding
             evidence_pack = research_data.get("evidence_pack", [])[:3]
             section_queries = research_data.get("section_queries", [])[:3]
@@ -277,6 +365,10 @@ class WriterAgent(AgentBase):
             # Use a tighter sources digest (3 sources, 100-char abstracts)
             sources_summary = self._build_sources_digest(research_data.get("sources", []), limit=3)
             evidence_summary = json.dumps(evidence_pack)
+            # Thesis: prefer explicitly passed arg, fall back to research_data field
+            effective_thesis = thesis or truncate_text(research_data.get("thesis", ""), 300)
+            # Research notes digest (e.g. "[1] Title: finding." format)
+            notes_digest = "\n".join(research_notes[:8]) if research_notes else ""
             thesis_goal = section_plan.get("thesis_goal", "")
             must_cover = section_plan.get("must_cover", [])
             evidence_requirements = section_plan.get("evidence_requirements", [])
@@ -284,8 +376,14 @@ class WriterAgent(AgentBase):
             subheading_hints = section_plan.get("subheading_hints", [])[:2]
             # Optional writing-style directive line (empty string → omitted cleanly)
             style_line = f"WRITING STYLE: {writing_style}\n" if writing_style else ""
+            # Thesis line (only added when a thesis is available)
+            thesis_line = f"CENTRAL THESIS: {effective_thesis}\n" if effective_thesis else ""
+            # Research notes line (only added when notes are available)
+            notes_line = f"RESEARCH NOTES:\n{notes_digest}\n\n" if notes_digest else ""
             prompt = (
                 f"Write the '{section}' section (~{word_count_target} words) of an academic essay on '{topic}'.\n\n"
+                f"{_FEW_SHOT_EXAMPLE}\n\n"
+                f"{thesis_line}"
                 f"SECTION OBJECTIVE: {thesis_goal}\n"
                 f"MUST COVER: {'; '.join(str(i) for i in must_cover)}\n"
                 f"EVIDENCE REQUIREMENTS: {'; '.join(str(i) for i in evidence_requirements)}\n"
@@ -293,6 +391,7 @@ class WriterAgent(AgentBase):
                 f"{style_line}"
                 f"SUBHEADINGS (optional, max 2): {', '.join(subheading_hints) if subheading_hints else 'None'}\n\n"
                 f"RESEARCH SYNTHESIS:\n{research_summary}\n\n"
+                f"{notes_line}"
                 f"EVIDENCE PACK (JSON):\n{evidence_summary}\n\n"
                 f"SOURCE DIGEST:\n{sources_summary}\n\n"
                 f"REVISION GUIDANCE:\n{truncate_text(feedback, 400) if feedback else 'None'}\n\n"
@@ -338,11 +437,21 @@ class WriterAgent(AgentBase):
                     max_tokens=quality_max_tokens(),
                 )
 
+            import re as _re
+            citation_count = len(_re.findall(r"\[\d+\]", content))
             return {
                 "section": section,
                 "content": content,
                 "word_count": len(content.split()),
                 "subheadings": self._extract_subheadings(content),
+                "validation": {
+                    "citation_count": citation_count,
+                    "has_limitation": any(
+                        kw in content.lower()
+                        for kw in ("limitation", "uncertain", "constraint", "caveat", "however")
+                    ),
+                },
             }
         except Exception as exc:
             raise RuntimeError(f"WriterAgent failed to generate section '{section}': {exc}") from exc
+

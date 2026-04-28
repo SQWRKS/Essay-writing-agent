@@ -298,6 +298,12 @@ class PlannerAgent(AgentBase):
             prompt = (
                 f"Create a detailed academic essay plan tailored to the topic: '{topic}'.\n"
                 f"{context_block}{word_count_block}{style_block}\n"
+                "Think step-by-step before producing the plan:\n"
+                "Step 1 – Identify the core academic question or debate the topic raises.\n"
+                "Step 2 – Decide which standard sections are appropriate (e.g. omit Results for non-empirical topics).\n"
+                "Step 3 – For each section, define its specific argument or claim (not just a description).\n"
+                "Step 4 – Generate precise, searchable research queries for each section.\n"
+                "Step 5 – Confirm that estimated_total_words equals the sum of included section word_count_targets.\n\n"
                 "Return a JSON object with keys: sections (list), research_queries (list), estimated_total_words (int).\n"
                 "Each section must have:\n"
                 "  key (snake_case), title, description, research_queries (list of 3 precise academic queries),\n"

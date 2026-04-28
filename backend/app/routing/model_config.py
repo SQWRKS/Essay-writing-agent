@@ -78,6 +78,9 @@ AGENT_MODELS: dict[str, dict[str, str]] = {
         # Currently a rule-based agent; model reserved for future LLM integration
         "default": MODEL_GPT5_MINI,
     },
+    "plagiarism": {
+        "default": MODEL_GPT5_MINI,    # lightweight assessment of flagged passages
+    },
     "figure": {
         # Currently a matplotlib-based agent; models reserved for future LLM integration
         "reasoning": MODEL_GPT5,

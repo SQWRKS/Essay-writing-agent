@@ -298,8 +298,6 @@ def test_writer_template_fallback_is_not_repetitive():
                 },
             ],
         },
-        test_project.id,
-        db,
     )
 
     content = result["content"]
@@ -887,6 +885,132 @@ async def test_web_search_agent_deduplicates_across_providers(db, test_project, 
     )
     assert result["total_found"] == 1
 
+
+# ===========================================================================
+# PlagiarismAgent tests
+# ===========================================================================
+
+def test_plagiarism_agent_approves_unique_sections():
+    from app.agents.plagiarism import PlagiarismAgent
+
+    agent = PlagiarismAgent()
+    sections = {
+        "introduction": (
+            "Transformer-based language models have transformed natural language processing, "
+            "enabling strong performance on question answering, summarisation, and reasoning tasks. "
+            "The introduction of the attention mechanism by Vaswani et al. was a pivotal development."
+        ),
+        "conclusion": (
+            "In conclusion, evidence shows that retrieval-augmented generation improves factual accuracy "
+            "in constrained deployment settings when retrieval precision is maintained above a threshold. "
+            "Future work should address domain adaptation under low-resource conditions."
+        ),
+    }
+    result = agent._heuristic_check(sections, sources=[])
+
+    assert result["approved"] is True
+    assert result["score"] >= 0.9
+    assert result["flagged_pairs"] == []
+    assert result["source_overlap_flags"] == []
+
+
+def test_plagiarism_agent_flags_duplicate_sentences_across_sections():
+    from app.agents.plagiarism import PlagiarismAgent
+
+    agent = PlagiarismAgent()
+    # Deliberately repeat a long sentence across two sections.
+    repeated = (
+        "Retrieval augmented generation systems improve answer grounding substantially in clinical "
+        "question answering benchmarks when evidence retrieval precision remains high."
+    )
+    sections = {
+        "introduction": f"{repeated} Additional context about the research landscape follows here.",
+        "conclusion": f"{repeated} This conclusion reiterates the same finding without paraphrasing.",
+    }
+    result = agent._heuristic_check(sections, sources=[])
+
+    assert result["flagged_pairs"], "Repeated sentence should be flagged"
+    assert result["flagged_pairs"][0]["similarity"] >= 0.55
+    assert result["approved"] is False
+
+
+def test_plagiarism_agent_flags_source_overlap():
+    from app.agents.plagiarism import PlagiarismAgent
+
+    agent = PlagiarismAgent()
+    abstract = (
+        "Transformer language models achieve state of the art results on reading comprehension "
+        "datasets including SQuAD by encoding long context with bidirectional attention."
+    )
+    # Section that nearly copies the abstract verbatim
+    section_text = (
+        "Transformer language models achieve state of the art results on reading comprehension "
+        "datasets including SQuAD by encoding long context with bidirectional attention mechanisms "
+        "from the source literature."
+    )
+    sources = [{"title": "BERT Paper", "abstract": abstract}]
+    sections = {"literature_review": section_text}
+
+    result = agent._heuristic_check(sections, sources=sources)
+
+    assert result["source_overlap_flags"], "Source overlap should be flagged"
+    assert result["source_overlap_flags"][0]["section"] == "literature_review"
+    assert result["approved"] is False
+
+
+def test_plagiarism_agent_flags_intra_section_repetition():
+    from app.agents.plagiarism import PlagiarismAgent
+
+    agent = PlagiarismAgent()
+    # Repeat the same phrase many times within one section
+    filler = "machine learning models improve performance on benchmark datasets. " * 6
+    sections = {"results": filler}
+
+    result = agent._heuristic_check(sections, sources=[])
+
+    assert result["repetition_flags"], "Internal repetition should be flagged"
+    assert result["repetition_flags"][0]["section"] == "results"
+
+
+def test_plagiarism_agent_heuristic_check_keys():
+    """Result dict must always contain the required keys."""
+    from app.agents.plagiarism import PlagiarismAgent
+
+    agent = PlagiarismAgent()
+    result = agent._heuristic_check(sections={}, sources=[])
+
+    for key in ("score", "approved", "feedback", "issues", "suggestions",
+                "flagged_pairs", "source_overlap_flags", "repetition_flags", "total_flag_count"):
+        assert key in result, f"Missing key: {key}"
+
+
+@pytest.mark.asyncio
+async def test_plagiarism_agent_execute_no_flags(db, test_project):
+    from app.agents.plagiarism import PlagiarismAgent
+
+    agent = PlagiarismAgent()
+    result = await agent.execute(
+        {
+            "sections": {
+                "introduction": (
+                    "Evidence-based retrieval systems have substantially improved grounded question "
+                    "answering in biomedical applications, particularly when corpus coverage is high [1]."
+                ),
+                "conclusion": (
+                    "In summary, retrieval quality is the primary driver of answer faithfulness and "
+                    "the key limitation of current systems is domain-specific annotation scarcity."
+                ),
+            },
+            "sources": [],
+        },
+        test_project.id,
+        db,
+    )
+
+    assert "score" in result
+    assert "approved" in result
+    assert "flagged_pairs" in result
+    assert 0.0 <= result["score"] <= 1.0
 
 
 # ===========================================================================
