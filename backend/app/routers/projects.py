@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import os
@@ -5,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -288,7 +289,7 @@ def _extract_pdf_text(content_bytes: bytes) -> str:
 
 
 @router.post("/{project_id}/run", status_code=202)
-async def run_pipeline(project_id: str, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+async def run_pipeline(project_id: str, db: AsyncSession = Depends(get_db)):
     project = await _load_project_or_404(project_id, db)
     if project.status == "running":
         raise HTTPException(status_code=409, detail="Pipeline already running")
@@ -306,12 +307,13 @@ async def run_pipeline(project_id: str, background_tasks: BackgroundTasks, db: A
             pass
 
     async def run_bg():
-        from app.database import AsyncSessionLocal
-        async with AsyncSessionLocal() as session:
+        import app.database as _app_db
+        factory = _app_db._bg_session_factory or _app_db.AsyncSessionLocal
+        async with factory() as session:
             pool = WorkerPool()
             await pool.execute_project_pipeline(project_id, topic, session, project_settings=project_settings)
 
-    background_tasks.add_task(run_bg)
+    asyncio.create_task(run_bg())
     return {"message": "Pipeline started", "project_id": project_id}
 
 

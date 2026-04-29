@@ -30,6 +30,12 @@ if settings.DATABASE_URL.startswith("sqlite+aiosqlite"):
 
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
+# Override this in tests to redirect background-task DB sessions to the test
+# engine.  Example (conftest.py):
+#   import app.database as _app_db
+#   _app_db._bg_session_factory = TestSessionLocal
+_bg_session_factory: "async_sessionmaker | None" = None
+
 
 async def get_db():
     async with AsyncSessionLocal() as session:
