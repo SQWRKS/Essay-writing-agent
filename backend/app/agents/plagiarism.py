@@ -18,6 +18,9 @@ from app.agents.base import AgentBase
 from app.agents.llm_client import is_llm_available, timed_chat_completion, truncate_text
 from app.routing.model_config import AGENT_MODELS
 
+# Score penalty applied per originality flag detected by the heuristic checks.
+_FLAG_PENALTY = 0.12
+
 # Minimum n-gram length (words) used for fingerprint comparison.
 _NGRAM_SIZE = 6
 # Similarity threshold above which two passages are considered near-duplicates.
@@ -94,7 +97,7 @@ class PlagiarismAgent(AgentBase):
         repetition_flags = self._check_intra_section_repetition(sections)
 
         total_flags = len(intra_flags) + len(source_flags) + len(repetition_flags)
-        score = max(0.0, 1.0 - total_flags * 0.12)
+        score = max(0.0, 1.0 - total_flags * _FLAG_PENALTY)
 
         issues: list[str] = []
         suggestions: list[str] = []

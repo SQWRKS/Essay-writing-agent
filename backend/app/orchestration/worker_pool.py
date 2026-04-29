@@ -914,7 +914,7 @@ class WorkerPool:
 
             await sse_manager.publish(
                 project_id,
-                "section_approved" if approved else "section_done",
+                "section_approved",
                 {
                     "project_id": project_id,
                     "section": sec_key,

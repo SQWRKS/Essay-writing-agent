@@ -26,7 +26,8 @@ class CitationAgent(AgentBase):
         for i, source in enumerate(sources):
             citation, in_text_key = self._format_source(i + 1, source, style)
 
-            # Optional LLM refinement for edge-case source types
+            # Optional LLM refinement for edge-case source types.
+            # Substring match is intentional: "conference proceedings" ⊇ "proceedings".
             if is_llm_available():
                 src_type = (source.get("type") or source.get("venue") or "").lower()
                 if any(t in src_type for t in _LLM_ESCALATION_TYPES):
